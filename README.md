@@ -119,18 +119,22 @@ logs/                  # 日志文件存储目录
 仓库根目录已经提供 Vercel 入口文件 [`index.py`](index.py)。
 当前使用 Vercel 对 FastAPI 的零配置识别能力，不再通过 `functions` 为根目录入口单独配函数规则，这样可以避免新版构建器要求 `api/` 目录时的匹配报错。
 
-在 Vercel 项目里只需要配置一个环境变量：
+由于 Vercel Functions 没有持久文件系统，本项目在 Vercel 部署时**必须使用 PostgreSQL**，至少要配置以下环境变量：
 
 ```bash
 AUTH_TOKEN=sk-your-api-key
+SESSION_SECRET_KEY=replace-with-a-long-random-secret
+DB_TYPE=postgresql
+DATABASE_URL=postgresql://user:password@host:5432/dbname
 ```
 
 部署完成后，直接使用分配到的域名访问即可。
 
 > ⚠️ **Vercel 使用说明**：
-> - Vercel 是 Serverless 运行时，数据库和请求日志会落到临时目录，**不会持久保存**
-> - 如果你需要长期保留 Token 池、请求日志或管理后台数据，建议继续使用 Docker / VPS 部署
+> - Vercel 是 Serverless 运行时，Vercel Functions 没有持久文件系统，因此不要在 Vercel 上使用 SQLite
+> - 在 Vercel 上请固定配置 `DB_TYPE=postgresql` 与 `DATABASE_URL=...`，用于持久保存 Token、请求日志和后台数据
 > - 如果你需要自定义函数时长，优先在 Vercel Project Settings 的 Functions 页面设置默认值
+> - `SESSION_SECRET_KEY` 不要使用默认值，建议在 Vercel 后台生成并配置一个足够长的随机字符串
 
 ## 📖 支持的模型
 
@@ -162,8 +166,9 @@ AUTH_TOKEN=sk-your-api-key
 | `ANONYMOUS_MODE` | `true` | Z.AI 匿名模式 |
 | `TOOL_SUPPORT` | `true` | Function Call 开关 |
 | `SKIP_AUTH_TOKEN` | `false` | 跳过认证（仅开发） |
-| `DB_TYPE` | `sqlite` | 数据库类型，支持 `sqlite` / `postgresql` |
-| `DATABASE_URL` | 空 | PostgreSQL 连接串，`DB_TYPE=postgresql` 时必填 |
+| `SESSION_SECRET_KEY` | `your-secret-key-change-in-production` | 管理后台 Session 密钥，生产环境与 Vercel **必须修改** |
+| `DB_TYPE` | `sqlite` | 数据库类型，支持 `sqlite` / `postgresql`；Vercel 部署必须设为 `postgresql` |
+| `DATABASE_URL` | 空 | PostgreSQL 连接串，`DB_TYPE=postgresql` 时必填，Vercel 部署必须配置 |
 | `DB_PATH` | `tokens.db` | SQLite 数据库文件路径（Docker: `/app/data/tokens.db`） |
 
 ### Token 配置

@@ -15,6 +15,28 @@ templates = Jinja2Templates(directory="app/templates")
 DEFAULT_TOKEN_NAMESPACE = "zai"
 
 
+def _normalize_token_for_template(token: dict) -> dict:
+    """将数据库记录规范化为模板可直接渲染的格式。"""
+    normalized = dict(token)
+
+    for field in ("total_requests", "successful_requests", "failed_requests", "priority"):
+        normalized[field] = int(normalized.get(field) or 0)
+
+    created_at = normalized.get("created_at")
+    if isinstance(created_at, datetime):
+        normalized["created_at_date"] = created_at.strftime("%Y-%m-%d")
+        normalized["created_at_time"] = created_at.strftime("%H:%M:%S")
+    elif created_at:
+        created_at_text = str(created_at)
+        normalized["created_at_date"] = created_at_text[:10]
+        normalized["created_at_time"] = created_at_text[11:19] if len(created_at_text) >= 19 else ""
+    else:
+        normalized["created_at_date"] = "N/A"
+        normalized["created_at_time"] = ""
+
+    return normalized
+
+
 # ==================== 认证 API ====================
 
 @router.post("/login")
@@ -429,10 +451,13 @@ async def get_tokens_list(request: Request):
     from app.services.token_dao import get_token_dao
 
     dao = get_token_dao()
-    tokens = await dao.get_tokens_by_provider(
-        DEFAULT_TOKEN_NAMESPACE,
-        enabled_only=False,
-    )
+    tokens = [
+        _normalize_token_for_template(token)
+        for token in await dao.get_tokens_by_provider(
+            DEFAULT_TOKEN_NAMESPACE,
+            enabled_only=False,
+        )
+    ]
 
     context = {
         "request": request,
@@ -679,7 +704,7 @@ async def validate_single_token(request: Request, token_id: int):
 
     if row:
         # 返回更新后的单行 HTML
-        token = dict(row)
+        token = _normalize_token_for_template(dict(row))
         context = {
             "request": request,
             "token": token,
