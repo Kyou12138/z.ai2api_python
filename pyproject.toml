@@ -7,7 +7,7 @@ name = "z-ai2api-python"
 version = "0.1.0"
 description = "一个为 Z.ai 提供 OpenAI 兼容接口的 Python 代理服务"
 readme = "README.md"
-requires-python = ">=3.9,<=3.12"
+requires-python = ">=3.9,<=3.13"
 license = { text = "MIT" }
 authors = [{ name = "Contributors" }]
 classifiers = [
