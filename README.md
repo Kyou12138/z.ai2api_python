@@ -113,6 +113,22 @@ logs/                  # 日志文件存储目录
 
 > 📖 **详细文档**：[Docker 部署指南](deploy/README_DOCKER.md)
 
+### Vercel 部署
+
+仓库根目录已经提供 Vercel 入口文件 [`index.py`](index.py) 和配置文件 [`vercel.json`](vercel.json)。
+
+在 Vercel 项目里只需要配置一个环境变量：
+
+```bash
+AUTH_TOKEN=sk-your-api-key
+```
+
+部署完成后，直接使用分配到的域名访问即可。
+
+> ⚠️ **Vercel 使用说明**：
+> - Vercel 是 Serverless 运行时，数据库和请求日志会落到临时目录，**不会持久保存**
+> - 如果你需要长期保留 Token 池、请求日志或管理后台数据，建议继续使用 Docker / VPS 部署
+
 ## 📖 支持的模型
 
 当前服务仅对接 Z.AI 提供的 GLM 系列模型。

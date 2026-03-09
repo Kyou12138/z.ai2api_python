@@ -6,6 +6,20 @@ from typing import Optional
 from pydantic_settings import BaseSettings
 
 
+def _is_vercel_runtime() -> bool:
+    """检测当前是否运行在 Vercel Serverless 环境。"""
+    return os.getenv("VERCEL") == "1" or bool(os.getenv("VERCEL_ENV"))
+
+
+IS_VERCEL = _is_vercel_runtime()
+DEFAULT_DEBUG_LOGGING = "false" if IS_VERCEL else "true"
+DEFAULT_DB_PATH = (
+    os.path.join(os.getenv("TMPDIR", "/tmp"), "tokens.db")
+    if IS_VERCEL
+    else "tokens.db"
+)
+
+
 class Settings(BaseSettings):
     """Application settings"""
 
@@ -33,7 +47,7 @@ class Settings(BaseSettings):
 
     # Server Configuration
     LISTEN_PORT: int = int(os.getenv("LISTEN_PORT", "8080"))
-    DEBUG_LOGGING: bool = os.getenv("DEBUG_LOGGING", "true").lower() == "true"
+    DEBUG_LOGGING: bool = os.getenv("DEBUG_LOGGING", DEFAULT_DEBUG_LOGGING).lower() == "true"
     SERVICE_NAME: str = os.getenv("SERVICE_NAME", "api-proxy-server")
     ROOT_PATH: str = os.getenv("ROOT_PATH", "")  # For Nginx reverse proxy path prefix, e.g., "/api" or "/path-prefix"
 
@@ -64,7 +78,7 @@ class Settings(BaseSettings):
     # Admin Panel Authentication
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")  # 管理后台密码
     SESSION_SECRET_KEY: str = os.getenv("SESSION_SECRET_KEY", "your-secret-key-change-in-production")  # Session 密钥
-    DB_PATH: str = os.getenv("DB_PATH", "tokens.db")
+    DB_PATH: str = os.getenv("DB_PATH", DEFAULT_DB_PATH)
 
     class Config:
         env_file = ".env"

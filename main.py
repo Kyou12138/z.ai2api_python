@@ -4,12 +4,13 @@
 import os
 import sys
 import psutil
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.core.config import settings
+from app.core.config import IS_VERCEL, settings
 from app.core import claude, openai
 from app.utils.reload_config import RELOAD_CONFIG
 from app.utils.logger import setup_logger
@@ -22,7 +23,10 @@ from granian import Granian
 
 
 # Setup logger
-logger = setup_logger(log_dir="logs", debug_mode=settings.DEBUG_LOGGING)
+logger = setup_logger(
+    log_dir=os.path.join(os.getenv("TMPDIR", "/tmp"), "logs") if IS_VERCEL else "logs",
+    debug_mode=settings.DEBUG_LOGGING,
+)
 
 
 async def warmup_upstream_client():
@@ -93,14 +97,12 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-# 挂载web端静态文件目录
-try:
-    app.mount("/static", StaticFiles(directory="app/static"), name="static")
-except RuntimeError:
-    # 如果 static 目录不存在，创建它
-    os.makedirs("app/static/css", exist_ok=True)
-    os.makedirs("app/static/js", exist_ok=True)
-    app.mount("/static", StaticFiles(directory="app/static"), name="static")
+# 挂载 Web 端静态文件目录；在只读文件系统中不尝试动态创建目录
+static_dir = Path("app/static")
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+else:
+    logger.info("ℹ️ 未找到静态资源目录 app/static，已跳过静态文件挂载")
 
 # Include API routers
 app.include_router(openai.router)
