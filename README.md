@@ -116,7 +116,8 @@ logs/                  # 日志文件存储目录
 
 ### Vercel 部署
 
-仓库根目录已经提供 Vercel 入口文件 [`index.py`](index.py) 和配置文件 [`vercel.json`](vercel.json)。
+仓库根目录已经提供 Vercel 入口文件 [`index.py`](index.py)。
+当前使用 Vercel 对 FastAPI 的零配置识别能力，不再通过 `functions` 为根目录入口单独配函数规则，这样可以避免新版构建器要求 `api/` 目录时的匹配报错。
 
 在 Vercel 项目里只需要配置一个环境变量：
 
@@ -129,6 +130,7 @@ AUTH_TOKEN=sk-your-api-key
 > ⚠️ **Vercel 使用说明**：
 > - Vercel 是 Serverless 运行时，数据库和请求日志会落到临时目录，**不会持久保存**
 > - 如果你需要长期保留 Token 池、请求日志或管理后台数据，建议继续使用 Docker / VPS 部署
+> - 如果你需要自定义函数时长，优先在 Vercel Project Settings 的 Functions 页面设置默认值
 
 ## 📖 支持的模型
 
