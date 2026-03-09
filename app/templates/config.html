@@ -125,6 +125,35 @@
                            class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm">
                     <p class="mt-1 text-sm text-gray-500">Function Call 功能扫描的最大字符数</p>
                 </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">数据库类型</label>
+                    <select name="db_type"
+                            class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm">
+                        <option value="sqlite" {{ 'selected' if (config.DB_TYPE or 'sqlite') == 'sqlite' else '' }}>SQLite</option>
+                        <option value="postgresql" {{ 'selected' if config.DB_TYPE in ['postgresql', 'postgres', 'pgsql', 'pg'] else '' }}>PostgreSQL</option>
+                    </select>
+                    <p class="mt-1 text-sm text-gray-500">默认使用 SQLite；切换为 PostgreSQL 后需提供连接串</p>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">PostgreSQL 连接串</label>
+                    <input type="text"
+                           name="database_url"
+                           value="{{ config.DATABASE_URL or '' }}"
+                           placeholder="postgresql://user:password@host:5432/dbname"
+                           class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm">
+                    <p class="mt-1 text-sm text-gray-500">仅在数据库类型为 PostgreSQL 时生效</p>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">SQLite 数据库路径</label>
+                    <input type="text"
+                           name="db_path"
+                           value="{{ config.DB_PATH or 'tokens.db' }}"
+                           class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm">
+                    <p class="mt-1 text-sm text-gray-500">仅在数据库类型为 SQLite 时生效</p>
+                </div>
             </div>
 
             <!-- 保存按钮 -->
@@ -157,7 +186,7 @@
                     <div class="ml-3">
                         <p class="text-sm text-blue-700">
                             <strong>提示：</strong>配置保存后会自动热重载，大部分配置无需重启服务即可生效。<br>
-                            仅 <code class="bg-blue-100 px-1 py-0.5 rounded">监听端口</code> 和 <code class="bg-blue-100 px-1 py-0.5 rounded">服务名称</code> 需要手动重启服务。
+                            仅 <code class="bg-blue-100 px-1 py-0.5 rounded">监听端口</code> 和 <code class="bg-blue-100 px-1 py-0.5 rounded">服务名称</code> 需要手动重启服务；切换数据库后建议观察一次后台与日志是否正常。
                         </p>
                     </div>
                 </div>

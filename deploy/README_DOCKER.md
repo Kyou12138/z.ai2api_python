@@ -79,6 +79,8 @@ deploy/
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
+| `DB_TYPE` | `sqlite` | 数据库类型，支持 `sqlite` / `postgresql` |
+| `DATABASE_URL` | 空 | PostgreSQL 连接串，`DB_TYPE=postgresql` 时必填 |
 | `DB_PATH` | `/app/data/tokens.db` | 数据库文件路径 |
 | `ADMIN_PASSWORD` | `admin123` | 管理后台密码 |
 | `AUTH_TOKEN` | `sk-your-api-key` | API 认证密钥 |
@@ -91,6 +93,14 @@ deploy/
 - 修改 `ADMIN_PASSWORD` 和 `AUTH_TOKEN`
 - 设置 `DEBUG_LOGGING=false`
 - 设置 `ANONYMOUS_MODE=false`
+
+**使用 PostgreSQL**:
+```bash
+DB_TYPE=postgresql
+DATABASE_URL=postgresql://user:password@postgres:5432/zai2api
+```
+
+启用 PostgreSQL 后，`DB_PATH` 将不再生效。
 
 ## 运维操作
 

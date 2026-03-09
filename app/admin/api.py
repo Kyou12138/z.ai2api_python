@@ -81,6 +81,10 @@ async def logout(request: Request):
 async def reload_settings():
     """热重载配置（重新加载环境变量并更新 settings 对象）"""
     from app.core.config import settings
+    from app.services.database import reset_database_backend
+    from app.services.request_log_dao import init_request_log_dao, reset_request_log_dao
+    from app.services.token_dao import init_token_database, reset_token_dao
+    from app.utils.token_pool import initialize_token_pool_from_db
     from app.utils.logger import setup_logger
     from dotenv import load_dotenv
 
@@ -96,6 +100,18 @@ async def reload_settings():
 
     # 重新初始化 logger（使用新的 DEBUG_LOGGING 配置）
     setup_logger(log_dir="logs", debug_mode=settings.DEBUG_LOGGING)
+
+    # 数据库配置变更后重建后端与 DAO 单例，并刷新 Token 池
+    reset_database_backend()
+    reset_token_dao()
+    reset_request_log_dao()
+    await init_token_database()
+    init_request_log_dao()
+    await initialize_token_pool_from_db(
+        provider="zai",
+        failure_threshold=settings.TOKEN_FAILURE_THRESHOLD,
+        recovery_timeout=settings.TOKEN_RECOVERY_TIMEOUT,
+    )
 
     logger.info(f"🔄 配置已热重载 (DEBUG_LOGGING={settings.DEBUG_LOGGING})")
 
@@ -213,6 +229,11 @@ async def save_config(request: Request):
             "# ========== 功能配置 ==========",
             f"TOOL_SUPPORT={'true' if 'tool_support' in form_data else 'false'}",
             f"SCAN_LIMIT={form_data.get('scan_limit', '200000')}",
+            "",
+            "# ========== 数据库配置 ==========",
+            f"DB_TYPE={form_data.get('db_type', 'sqlite')}",
+            f"DATABASE_URL={form_data.get('database_url', '')}",
+            f"DB_PATH={form_data.get('db_path', 'tokens.db')}",
             "",
             "# ========== Token 池配置 ==========",
             f"TOKEN_FAILURE_THRESHOLD={form_data.get('token_failure_threshold', '3')}",

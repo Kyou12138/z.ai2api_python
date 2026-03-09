@@ -18,6 +18,12 @@ DEFAULT_DB_PATH = (
     if IS_VERCEL
     else "tokens.db"
 )
+DEFAULT_DB_TYPE = (
+    "postgresql"
+    if (os.getenv("DATABASE_URL", "").startswith("postgres://")
+        or os.getenv("DATABASE_URL", "").startswith("postgresql://"))
+    else "sqlite"
+)
 
 
 class Settings(BaseSettings):
@@ -78,6 +84,8 @@ class Settings(BaseSettings):
     # Admin Panel Authentication
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")  # 管理后台密码
     SESSION_SECRET_KEY: str = os.getenv("SESSION_SECRET_KEY", "your-secret-key-change-in-production")  # Session 密钥
+    DB_TYPE: str = os.getenv("DB_TYPE", DEFAULT_DB_TYPE)
+    DATABASE_URL: Optional[str] = os.getenv("DATABASE_URL")
     DB_PATH: str = os.getenv("DB_PATH", DEFAULT_DB_PATH)
 
     class Config:

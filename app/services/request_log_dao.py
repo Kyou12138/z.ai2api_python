@@ -2,48 +2,37 @@
 请求日志数据访问层 (DAO)
 提供请求日志的 CRUD 操作和查询功能
 """
-import aiosqlite
-import sqlite3
-from typing import List, Dict, Optional
-from datetime import datetime, timedelta
-from contextlib import asynccontextmanager
-import os
 
-from app.models.request_log import SQL_CREATE_REQUEST_LOGS_TABLE, DB_PATH
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+from app.models.request_log import get_request_log_schema_statements
+from app.services.database import get_database_backend
 from app.utils.logger import logger
 
 
 class RequestLogDAO:
     """请求日志数据访问对象"""
 
-    def __init__(self, db_path: str = DB_PATH):
+    def __init__(self):
         """初始化 DAO"""
-        self.db_path = db_path
-        self._ensure_db_directory()
+        self.db = get_database_backend()
         self._init_db()
-
-    def _ensure_db_directory(self):
-        """确保数据库目录存在"""
-        db_dir = os.path.dirname(self.db_path)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
 
     def _init_db(self):
         """初始化数据库表"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.executescript(SQL_CREATE_REQUEST_LOGS_TABLE)
-            self._ensure_columns(conn)
-            conn.commit()
-            conn.close()
+            self.db.execute_statements_sync(
+                get_request_log_schema_statements(self.db.db_type)
+            )
+            self._ensure_columns()
             logger.debug("请求日志表初始化成功")
         except Exception as e:
             logger.error(f"初始化请求日志表失败: {e}")
 
-    def _ensure_columns(self, conn: sqlite3.Connection):
+    def _ensure_columns(self):
         """为旧数据库补齐新增列。"""
-        cursor = conn.execute("PRAGMA table_info(request_logs)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
         required_columns = {
             "endpoint": "TEXT DEFAULT ''",
             "source": "TEXT DEFAULT 'unknown'",
@@ -52,22 +41,41 @@ class RequestLogDAO:
             "status_code": "INTEGER DEFAULT 200",
         }
 
-        for column, definition in required_columns.items():
-            if column in existing_columns:
-                continue
-            conn.execute(
-                f"ALTER TABLE request_logs ADD COLUMN {column} {definition}"
-            )
+        with self.db.sync_connection() as conn:
+            if self.db.is_sqlite:
+                cursor = conn.execute("PRAGMA table_info(request_logs)")
+                existing_columns = {row[1] for row in cursor.fetchall()}
+                for column, definition in required_columns.items():
+                    if column in existing_columns:
+                        continue
+                    conn.execute(
+                        f"ALTER TABLE request_logs ADD COLUMN {column} {definition}"
+                    )
+            else:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = %s
+                        """,
+                        ("request_logs",),
+                    )
+                    existing_columns = {row[0] for row in cursor.fetchall()}
+                    for column, definition in required_columns.items():
+                        if column in existing_columns:
+                            continue
+                        cursor.execute(
+                            f"ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS {column} {definition}"
+                        )
+            conn.commit()
 
     @asynccontextmanager
     async def get_connection(self):
         """获取异步数据库连接"""
-        conn = await aiosqlite.connect(self.db_path)
-        conn.row_factory = aiosqlite.Row
-        try:
+        async with self.db.connection() as conn:
             yield conn
-        finally:
-            await conn.close()
 
     async def add_log(
         self,
@@ -109,6 +117,37 @@ class RequestLogDAO:
         total_tokens = input_tokens + output_tokens
 
         async with self.get_connection() as conn:
+            if self.db.is_postgresql:
+                cursor = await conn.execute(
+                    """
+                    INSERT INTO request_logs
+                    (provider, endpoint, source, protocol, client_name, model,
+                     status_code, success, duration, first_token_time,
+                     input_tokens, output_tokens, total_tokens, error_message)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id
+                    """,
+                    (
+                        provider,
+                        endpoint,
+                        source,
+                        protocol,
+                        client_name,
+                        model,
+                        status_code,
+                        success,
+                        duration,
+                        first_token_time,
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        error_message,
+                    ),
+                )
+                row = await cursor.fetchone()
+                await conn.commit()
+                return int(row["id"]) if row else 0
+
             cursor = await conn.execute(
                 """
                 INSERT INTO request_logs
@@ -132,10 +171,10 @@ class RequestLogDAO:
                     output_tokens,
                     total_tokens,
                     error_message,
-                )
+                ),
             )
             await conn.commit()
-            return cursor.lastrowid
+            return cursor.lastrowid or 0
 
     async def get_recent_logs(
         self,
@@ -204,7 +243,7 @@ class RequestLogDAO:
             日志列表
         """
         query = "SELECT * FROM request_logs WHERE timestamp BETWEEN ? AND ?"
-        params = [start_time.isoformat(), end_time.isoformat()]
+        params = [start_time, end_time]
 
         if provider:
             query += " AND provider = ?"
@@ -239,8 +278,8 @@ class RequestLogDAO:
                 SELECT
                     model,
                     COUNT(*) as total,
-                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success,
-                    SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failed,
+                    SUM(CASE WHEN success THEN 1 ELSE 0 END) as success,
+                    SUM(CASE WHEN NOT success THEN 1 ELSE 0 END) as failed,
                     SUM(input_tokens) as input_tokens,
                     SUM(output_tokens) as output_tokens,
                     SUM(total_tokens) as total_tokens,
@@ -251,23 +290,27 @@ class RequestLogDAO:
                 GROUP BY model
                 ORDER BY total DESC
                 """,
-                (start_time.isoformat(),)
+                (start_time,),
             )
             rows = await cursor.fetchall()
 
             result = {}
             for row in rows:
-                model = row['model']
+                model = row["model"]
                 result[model] = {
-                    'total': row['total'],
-                    'success': row['success'],
-                    'failed': row['failed'],
-                    'input_tokens': row['input_tokens'] or 0,
-                    'output_tokens': row['output_tokens'] or 0,
-                    'total_tokens': row['total_tokens'] or 0,
-                    'avg_duration': round(row['avg_duration'] or 0, 2),
-                    'avg_first_token_time': round(row['avg_first_token_time'] or 0, 2),
-                    'success_rate': round((row['success'] / row['total'] * 100) if row['total'] > 0 else 0, 1)
+                    "total": row["total"],
+                    "success": row["success"] or 0,
+                    "failed": row["failed"] or 0,
+                    "input_tokens": row["input_tokens"] or 0,
+                    "output_tokens": row["output_tokens"] or 0,
+                    "total_tokens": row["total_tokens"] or 0,
+                    "avg_duration": round(row["avg_duration"] or 0, 2),
+                    "avg_first_token_time": round(row["avg_first_token_time"] or 0, 2),
+                    "success_rate": round(
+                        (((row["success"] or 0) / row["total"]) * 100)
+                        if row["total"] > 0 else 0,
+                        1,
+                    ),
                 }
 
             return result
@@ -287,13 +330,12 @@ class RequestLogDAO:
         async with self.get_connection() as conn:
             cursor = await conn.execute(
                 "DELETE FROM request_logs WHERE timestamp < ?",
-                (cutoff_time.isoformat(),)
+                (cutoff_time,),
             )
             await conn.commit()
             return cursor.rowcount
 
 
-# 全局单例实例
 _request_log_dao: Optional[RequestLogDAO] = None
 
 
@@ -308,6 +350,12 @@ def get_request_log_dao() -> RequestLogDAO:
     if _request_log_dao is None:
         _request_log_dao = RequestLogDAO()
     return _request_log_dao
+
+
+def reset_request_log_dao() -> None:
+    """重置请求日志 DAO 单例。"""
+    global _request_log_dao
+    _request_log_dao = None
 
 
 def init_request_log_dao():

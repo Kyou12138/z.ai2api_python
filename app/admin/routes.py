@@ -90,6 +90,9 @@ async def config_page(request: Request):
             "TOKEN_FAILURE_THRESHOLD": settings.TOKEN_FAILURE_THRESHOLD,
             "TOKEN_RECOVERY_TIMEOUT": settings.TOKEN_RECOVERY_TIMEOUT,
             "SCAN_LIMIT": settings.SCAN_LIMIT,
+            "DB_TYPE": settings.DB_TYPE,
+            "DATABASE_URL": settings.DATABASE_URL,
+            "DB_PATH": settings.DB_PATH,
         },
         "env_content": env_content,
     }
