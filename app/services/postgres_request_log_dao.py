@@ -54,6 +54,11 @@ POSTGRES_REQUEST_LOG_REQUIRED_COLUMNS = {
     "created_at": "TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
 }
 
+POSTGRES_REQUEST_LOG_TIME_COLUMNS = (
+    "timestamp",
+    "created_at",
+)
+
 
 def _get_missing_required_columns(
     existing_columns: set[str],
@@ -63,6 +68,36 @@ def _get_missing_required_columns(
         for column, definition in POSTGRES_REQUEST_LOG_REQUIRED_COLUMNS.items()
         if column not in existing_columns
     }
+
+
+def _uses_timestamptz(data_type: str | None) -> bool:
+    return str(data_type or "").strip().lower() == "timestamp with time zone"
+
+
+def _get_legacy_time_columns(
+    column_types: dict[str, str],
+) -> list[str]:
+    legacy_columns: list[str] = []
+    for column in POSTGRES_REQUEST_LOG_TIME_COLUMNS:
+        data_type = str(column_types.get(column) or "").strip().lower()
+        if data_type == "timestamp without time zone":
+            legacy_columns.append(column)
+    return legacy_columns
+
+
+def _coerce_datetime_for_column(
+    value: datetime,
+    *,
+    use_timezone: bool,
+) -> datetime:
+    if use_timezone:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _normalize_trend_window(window: Optional[str], days: Optional[int]) -> str:
@@ -85,6 +120,9 @@ def _normalize_trend_window(window: Optional[str], days: Optional[int]) -> str:
 class PostgresRequestLogDAO:
     """PostgreSQL 请求日志 DAO。"""
 
+    def __init__(self) -> None:
+        self._timestamp_uses_timezone = True
+
     async def init_database(self):
         pool = await get_postgres_pool()
         async with pool.acquire() as conn:
@@ -95,13 +133,17 @@ class PostgresRequestLogDAO:
         """为旧 PostgreSQL 表结构补齐新增列。"""
         existing_rows = await conn.fetch(
             """
-            SELECT column_name
+            SELECT column_name, data_type
             FROM information_schema.columns
             WHERE table_schema = 'public' AND table_name = 'request_logs'
             """
         )
         existing_columns = {
             str(row["column_name"])
+            for row in existing_rows
+        }
+        column_types = {
+            str(row["column_name"]): str(row["data_type"])
             for row in existing_rows
         }
 
@@ -112,6 +154,31 @@ class PostgresRequestLogDAO:
                 f"{column} {definition}"
             )
             logger.info("🩹 已为 request_logs 补齐列: {}", column)
+
+        legacy_time_columns = _get_legacy_time_columns(column_types)
+        for column in legacy_time_columns:
+            await conn.execute(
+                "ALTER TABLE request_logs "
+                f'ALTER COLUMN "{column}" TYPE TIMESTAMPTZ '
+                f'USING "{column}" AT TIME ZONE \'UTC\''
+            )
+            logger.info(
+                "🩹 已将 request_logs.{} 升级为 TIMESTAMPTZ",
+                column,
+            )
+
+        if legacy_time_columns:
+            self._timestamp_uses_timezone = True
+        else:
+            self._timestamp_uses_timezone = _uses_timestamptz(
+                column_types.get("timestamp")
+            )
+
+    def _coerce_time_param(self, value: datetime) -> datetime:
+        return _coerce_datetime_for_column(
+            value,
+            use_timezone=self._timestamp_uses_timezone,
+        )
 
     async def add_log(
         self,
@@ -246,7 +313,10 @@ class PostgresRequestLogDAO:
         model: str = None,
     ) -> List[Dict]:
         query = "SELECT * FROM request_logs WHERE timestamp BETWEEN $1 AND $2"
-        params: list[object] = [start_time, end_time]
+        params: list[object] = [
+            self._coerce_time_param(start_time),
+            self._coerce_time_param(end_time),
+        ]
         index = 3
 
         if provider:
@@ -450,6 +520,7 @@ class PostgresRequestLogDAO:
             WHERE timestamp >= $1
         """
         params: list[object] = [start_time]
+        params[0] = self._coerce_time_param(start_time)
         if provider:
             query += " AND provider = $2"
             params.append(provider)
@@ -493,7 +564,9 @@ class PostgresRequestLogDAO:
         }
 
     async def get_model_stats_from_db(self, hours: int = 24) -> Dict:
-        start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
+        start_time = self._coerce_time_param(
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        )
         pool = await get_postgres_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -541,7 +614,9 @@ class PostgresRequestLogDAO:
         return result
 
     async def delete_old_logs(self, days: int = 30) -> int:
-        cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff_time = self._coerce_time_param(
+            datetime.now(timezone.utc) - timedelta(days=days)
+        )
         pool = await get_postgres_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
