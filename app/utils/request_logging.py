@@ -23,6 +23,13 @@ def _coerce_int(value: Any) -> int:
         return 0
 
 
+def _coerce_status_code(value: Any, default: int = 500) -> int:
+    code = _coerce_int(value)
+    if 100 <= code <= 599:
+        return code
+    return default
+
+
 def _merge_usage(
     current: Dict[str, int],
     update: Dict[str, int],
@@ -223,7 +230,7 @@ async def wrap_openai_stream_with_logging(
                                 error.get("message")
                                 or "Unknown stream error"
                             )
-                            status_code = int(error.get("code") or 500)
+                            status_code = _coerce_status_code(error.get("code"))
                         else:
                             if (
                                 not first_token_time
