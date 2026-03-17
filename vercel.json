@@ -14,7 +14,7 @@
   "crons": [
     {
       "path": "/internal/cron/tokens/maintenance",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 19 * * *"
     }
   ]
 }
