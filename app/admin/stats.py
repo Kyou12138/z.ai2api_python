@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 import psutil
 
+from app.core.config import settings
 from app.services.request_log_dao import RequestLogDAO, get_request_log_dao
 from app.services.token_dao import TokenDAO, get_token_dao
 from app.utils.token_pool import TokenPool, get_token_pool
@@ -79,6 +80,8 @@ def format_uptime(total_seconds: int) -> str:
 
 def get_process_uptime() -> str:
     """获取当前进程运行时长。"""
+    if settings.is_vercel:
+        return "Serverless 实例"
     created_at = psutil.Process(os.getpid()).create_time()
     return format_uptime(int(time.time() - created_at))
 

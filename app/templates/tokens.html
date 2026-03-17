@@ -8,9 +8,7 @@
     showValidateModal: false,
     newToken: "",
     bulkTokens: "",
-    hasImportSourceDir: {{ "true" if automation.has_import_source_dir else "false" }},
     hasMaintenanceActions: {{ "true" if automation.has_maintenance_actions else "false" }},
-    isImporting: false,
     isRunningMaintenance: false,
     isValidating: false
 }'>
@@ -80,63 +78,47 @@
         </div>
     </div>
 
-    <!-- 自动目录导入与维护 -->
+    <!-- 自动维护与导入说明 -->
     <div id="token-automation" class="grid grid-cols-1 gap-6 xl:grid-cols-2">
         <section class="bg-white shadow rounded-lg p-6 space-y-5">
             <div class="flex items-start justify-between gap-4">
                 <div>
-                    <h3 class="text-lg font-medium text-gray-900">目录导入策略</h3>
+                    <h3 class="text-lg font-medium text-gray-900">导入方式调整</h3>
                     <p class="mt-1 text-sm text-gray-600">
-                        配置入口已迁移到配置管理页。这里仅展示当前策略，并允许立即执行一次导入。
+                        当前版本已移除服务端本地目录导入，避免 Serverless 只读文件系统带来的不确定性。
                     </p>
                 </div>
-                <span class="inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold {% if automation.import_enabled %}bg-emerald-100 text-emerald-700{% else %}bg-gray-100 text-gray-600{% endif %}">
-                    {{ '定时已开启' if automation.import_enabled else '定时已关闭' }}
+                <span class="inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold bg-amber-100 text-amber-700">
+                    目录导入已移除
                 </span>
             </div>
 
-            {% if automation.has_import_source_dir %}
             <div class="rounded-lg border border-emerald-100 bg-emerald-50 p-4 text-sm text-emerald-700">
-                手动导入会复用当前配置的目录和验证逻辑，重复 Token 会自动跳过。
+                现在推荐直接使用页面下方的“添加 Token”弹窗进行单个或批量导入。
+                这部分仍会沿用现有验证逻辑，重复 Token 会自动跳过。
             </div>
-            {% else %}
-            <div class="rounded-lg border border-amber-100 bg-amber-50 p-4 text-sm text-amber-700">
-                还没有配置导入目录，无法执行手动导入。请先到配置管理页设置 `TOKEN_AUTO_IMPORT_SOURCE_DIR`。
-            </div>
-            {% endif %}
 
             <dl class="space-y-4 text-sm">
                 <div class="rounded-lg border border-gray-200 p-4">
-                    <dt class="font-medium text-gray-700">Token 目录</dt>
-                    <dd class="mt-2 rounded-md bg-gray-50 px-3 py-2 font-mono text-xs text-gray-700 break-all">
-                        {{ automation.import_source_dir or '未配置' }}
-                    </dd>
+                    <dt class="font-medium text-gray-700">当前推荐方式</dt>
+                    <dd class="mt-2 text-gray-900">手动单个 / 批量添加 Token</dd>
                 </div>
                 <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     <div class="rounded-lg border border-gray-200 p-4">
-                        <dt class="font-medium text-gray-700">扫描间隔</dt>
-                        <dd class="mt-2 text-gray-900">{{ automation.import_interval }} 秒</dd>
+                        <dt class="font-medium text-gray-700">目录扫描</dt>
+                        <dd class="mt-2 text-gray-900">不再支持</dd>
                     </div>
                     <div class="rounded-lg border border-gray-200 p-4">
-                        <dt class="font-medium text-gray-700">配置位置</dt>
-                        <dd class="mt-2 text-gray-900">配置管理 / Token 池策略</dd>
+                        <dt class="font-medium text-gray-700">替代方案</dt>
+                        <dd class="mt-2 text-gray-900">页面添加 + 数据库存储</dd>
                     </div>
                 </div>
             </dl>
 
             <div class="flex flex-wrap gap-3 pt-2">
-                <a href="{{ automation.config_url }}"
-                   class="px-4 py-2 border border-emerald-200 text-emerald-700 rounded-md text-sm font-medium hover:bg-emerald-50">
-                    去配置中心修改
-                </a>
-                <button type="button"
-                        hx-post="/admin/api/tokens/import-directory"
-                        hx-target="#notification"
-                        @htmx:before-request="isImporting = true"
-                        @htmx:after-request="isImporting = false; if ($event.detail.successful) { htmx.trigger('body', 'tokenListRefresh'); htmx.trigger('body', 'statsRefresh'); }"
-                        :disabled="isImporting || !hasImportSourceDir"
-                        class="px-4 py-2 bg-emerald-600 text-white rounded-md text-sm font-medium hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed">
-                    立即导入当前目录
+                <button @click="showAddModal = true"
+                        class="px-4 py-2 bg-emerald-600 text-white rounded-md text-sm font-medium hover:bg-emerald-700">
+                    立即添加 Token
                 </button>
             </div>
         </section>

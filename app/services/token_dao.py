@@ -9,7 +9,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
 
+from app.core.config import settings
+from app.core.runtime_env import is_postgres_url
 from app.models.token_db import DB_PATH, SQL_CREATE_TABLES
+from app.services.postgres_token_dao import PostgresTokenDAO
 from app.utils.logger import logger
 
 
@@ -499,6 +502,40 @@ class TokenDAO:
             logger.error(f"❌ 统计 Token 总数失败: {e}")
             return 0
 
+    async def get_token_provider(self, token_id: int) -> str:
+        """根据 Token ID 获取提供商。"""
+        try:
+            async with self.get_connection() as conn:
+                cursor = await conn.execute(
+                    "SELECT provider FROM tokens WHERE id = ?",
+                    (token_id,),
+                )
+                row = await cursor.fetchone()
+            return str(row["provider"]) if row else "zai"
+        except Exception as e:
+            logger.error(f"❌ 查询 Token 提供商失败: {e}")
+            return "zai"
+
+    async def get_token_with_stats(self, token_id: int) -> Optional[Dict]:
+        """获取单个 Token 的详情和统计。"""
+        try:
+            async with self.get_connection() as conn:
+                cursor = await conn.execute(
+                    """
+                    SELECT t.*, ts.total_requests, ts.successful_requests, ts.failed_requests,
+                           ts.last_success_time, ts.last_failure_time
+                    FROM tokens t
+                    LEFT JOIN token_stats ts ON t.id = ts.token_id
+                    WHERE t.id = ?
+                    """,
+                    (token_id,),
+                )
+                row = await cursor.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"❌ 查询 Token 详情失败: {e}")
+            return None
+
     # ==================== Token 验证操作 ====================
 
     async def validate_and_update_token(self, token_id: int) -> bool:
@@ -654,7 +691,10 @@ def get_token_dao() -> TokenDAO:
     """获取全局 TokenDAO 实例"""
     global _token_dao
     if _token_dao is None:
-        _token_dao = TokenDAO()
+        if is_postgres_url(settings.normalized_database_url):
+            _token_dao = PostgresTokenDAO()
+        else:
+            _token_dao = TokenDAO()
     return _token_dao
 
 

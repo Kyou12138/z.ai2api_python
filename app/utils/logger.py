@@ -3,13 +3,20 @@
 
 import sys
 from pathlib import Path
+
 from loguru import logger
 
 # Global logger instance
 app_logger = None
 
 
-def setup_logger(log_dir, log_retention_days=7, log_rotation="1 day", debug_mode=False):
+def setup_logger(
+    log_dir,
+    log_retention_days=7,
+    log_rotation="1 day",
+    debug_mode=False,
+    enable_file_logging=True,
+):
     """
     Create a logger instance
 
@@ -37,7 +44,7 @@ def setup_logger(log_dir, log_retention_days=7, log_rotation="1 day", debug_mode
     logger.add(sys.stderr, level=log_level, format=console_format, colorize=True)
 
     # 只有在 debug_mode 时才添加文件输出
-    if debug_mode:
+    if debug_mode and enable_file_logging:
         try:
             log_path = Path(log_dir)
             log_path.mkdir(parents=True, exist_ok=True)
@@ -71,7 +78,16 @@ def get_logger():
     if app_logger is None:
         # 如果没有设置过logger，使用默认配置
         logger.remove()  # 移除所有现有处理器
-        logger.add(sys.stderr, level="INFO", format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | <level>{message}</level>")
+        logger.add(
+            sys.stderr,
+            level="INFO",
+            format=(
+                "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+                "<level>{level: <8}</level> | "
+                "<cyan>{name}</cyan>:<cyan>{function}</cyan>:"
+                "<cyan>{line}</cyan> | <level>{message}</level>"
+            ),
+        )
         app_logger = logger
     return app_logger
 
@@ -91,7 +107,7 @@ if __name__ == "__main__":
             logger.critical("这是一条严重日志")
 
             try:
-                1 / 0
+                raise ZeroDivisionError
             except ZeroDivisionError:
                 logger.exception("发生了除零异常")
 

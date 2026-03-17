@@ -1,129 +1,114 @@
-"""
-管理后台认证中间件
-"""
-from fastapi import Request, HTTPException, status
-from fastapi.responses import RedirectResponse
-from typing import Optional
+"""管理后台认证中间件。"""
+
+from __future__ import annotations
+
+import base64
 import hashlib
-import secrets
-from datetime import datetime, timedelta
+import hmac
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import HTTPException, Request, status
 
 from app.core.config import settings
 
-# 简单的内存 Session 存储（生产环境建议使用 Redis）
-_sessions = {}
-
-# Session 有效期（小时）
 SESSION_EXPIRE_HOURS = 24
 
 
-def generate_session_token() -> str:
-    """生成随机 session token"""
-    return secrets.token_urlsafe(32)
+def _urlsafe_b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
 
 
-def create_session(password: str) -> Optional[str]:
-    """
-    创建 session
+def _urlsafe_b64decode(raw: str) -> bytes:
+    text = str(raw or "")
+    padding = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode((text + padding).encode("utf-8"))
 
-    Args:
-        password: 用户输入的密码
 
-    Returns:
-        session_token 或 None（密码错误）
-    """
-    # 验证密码
+def generate_session_token(password: str) -> Optional[str]:
+    """生成签名 Session Token。"""
     if password != settings.ADMIN_PASSWORD:
         return None
 
-    # 生成 session token
-    session_token = generate_session_token()
-
-    # 存储 session（包含过期时间）
-    _sessions[session_token] = {
-        "created_at": datetime.now(),
-        "expires_at": datetime.now() + timedelta(hours=SESSION_EXPIRE_HOURS),
-        "authenticated": True
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=SESSION_EXPIRE_HOURS)
+    payload = {
+        "authenticated": True,
+        "exp": int(expires_at.timestamp()),
     }
+    payload_raw = json.dumps(
+        payload,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    payload_token = _urlsafe_b64encode(payload_raw)
+    signature = hmac.new(
+        settings.SESSION_SECRET_KEY.encode("utf-8"),
+        payload_token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload_token}.{signature}"
 
-    return session_token
+
+def create_session(password: str) -> Optional[str]:
+    """创建签名 Cookie。"""
+    return generate_session_token(password)
 
 
 def verify_session(session_token: Optional[str]) -> bool:
-    """
-    验证 session 是否有效
-
-    Args:
-        session_token: Session token
-
-    Returns:
-        是否已认证
-    """
-    if not session_token:
+    """验证签名 Cookie。"""
+    if not session_token or "." not in str(session_token):
         return False
 
-    session = _sessions.get(session_token)
-    if not session:
+    payload_token, provided_signature = str(session_token).rsplit(".", 1)
+    expected_signature = hmac.new(
+        settings.SESSION_SECRET_KEY.encode("utf-8"),
+        payload_token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(provided_signature, expected_signature):
         return False
 
-    # 检查是否过期
-    if datetime.now() > session["expires_at"]:
-        # 删除过期 session
-        del _sessions[session_token]
+    try:
+        payload = json.loads(_urlsafe_b64decode(payload_token).decode("utf-8"))
+    except Exception:
         return False
 
-    return session.get("authenticated", False)
+    if not payload.get("authenticated"):
+        return False
+
+    expires_at = int(payload.get("exp") or 0)
+    return datetime.now(timezone.utc).timestamp() <= expires_at
 
 
 def delete_session(session_token: Optional[str]):
-    """删除 session（登出）"""
-    if session_token and session_token in _sessions:
-        del _sessions[session_token]
+    """无状态 Cookie 模式下由客户端删除 Cookie 即可。"""
+    return None
 
 
 def get_session_token_from_request(request: Request) -> Optional[str]:
-    """从请求中获取 session token"""
+    """从请求中获取 Session Token。"""
     return request.cookies.get("admin_session")
 
 
 async def require_auth(request: Request):
-    """
-    认证依赖项：要求用户已登录
-
-    在路由中使用：
-    @router.get("/admin", dependencies=[Depends(require_auth)])
-    """
+    """要求用户已登录。"""
     session_token = get_session_token_from_request(request)
-
     if not verify_session(session_token):
-        # 未认证，重定向到登录页
         raise HTTPException(
             status_code=status.HTTP_303_SEE_OTHER,
             detail="未登录",
-            headers={"Location": "/admin/login"}
+            headers={"Location": "/admin/login"},
         )
 
 
 def get_authenticated_user(request: Request) -> bool:
-    """
-    获取当前认证状态（用于模板）
-
-    Returns:
-        是否已认证
-    """
+    """获取当前请求是否已认证。"""
     session_token = get_session_token_from_request(request)
     return verify_session(session_token)
 
 
 def cleanup_expired_sessions():
-    """清理过期的 session（定时任务调用）"""
-    now = datetime.now()
-    expired_tokens = [
-        token for token, session in _sessions.items()
-        if now > session["expires_at"]
-    ]
-
-    for token in expired_tokens:
-        del _sessions[token]
-
-    return len(expired_tokens)
+    """兼容旧接口：无状态 Cookie 模式无需后台清理。"""
+    return 0

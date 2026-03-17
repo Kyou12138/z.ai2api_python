@@ -6,13 +6,16 @@ from jinja2 import Environment, FileSystemLoader
 from starlette.requests import Request
 
 from app.admin import api as admin_api
+from app.admin import config_manager
 from app.admin.config_manager import (
     CONFIG_FIELD_SPECS,
     build_config_page_data,
+    build_form_updates,
     save_form_config,
     save_source_config,
     validate_env_source,
 )
+from app.services.runtime_config_dao import RuntimeConfigDAO
 
 
 def _build_form_payload(**overrides):
@@ -61,34 +64,28 @@ def _make_form_request(path: str, data: dict[str, str]) -> Request:
 
 
 @pytest.mark.asyncio
-async def test_build_config_page_data_includes_sections_and_override_status(
-    tmp_path,
-):
-    env_path = tmp_path / ".env"
-    example_path = tmp_path / ".env.example"
-    env_path.write_text(
-        "API_ENDPOINT=https://example.com/v1/chat\nDEBUG_LOGGING=true\n",
-        encoding="utf-8",
-    )
-    example_path.write_text("SERVICE_NAME=example\n", encoding="utf-8")
-
+async def test_build_config_page_data_marks_database_and_env_sources():
     settings_stub = SimpleNamespace(
         API_ENDPOINT="https://example.com/v1/chat",
-        DEBUG_LOGGING=True,
-        GLM5_MODEL="GLM-5",
-        ADMIN_PASSWORD="secret",
+        TOOL_SUPPORT=False,
+        AUTH_TOKEN="secret-auth",
+        ADMIN_PASSWORD="secret-admin",
+        uses_postgres=True,
+        is_vercel=True,
     )
 
     page_data = build_config_page_data(
         settings_obj=settings_stub,
-        env_path=env_path,
-        env_example_path=example_path,
+        runtime_overrides={
+            "API_ENDPOINT": "https://example.com/v2/chat",
+            "TOOL_SUPPORT": "false",
+        },
     )
 
-    assert page_data["overview"]["total_sections"] >= 7
-    assert page_data["overview"]["total_fields"] >= 35
-    assert page_data["overview"]["overridden_fields"] == 2
-    assert page_data["overview"]["example_exists"] is True
+    assert page_data["overview"]["total_sections"] >= 6
+    assert page_data["overview"]["database_overrides"] == 2
+    assert page_data["overview"]["runtime_storage"] == "PostgreSQL"
+    assert page_data["overview"]["is_vercel"] is True
 
     field_map = {
         field["key"]: field
@@ -96,20 +93,22 @@ async def test_build_config_page_data_includes_sections_and_override_status(
         for field in section["fields"]
     }
 
-    assert field_map["API_ENDPOINT"]["source_label"] == ".env"
-    assert field_map["DEBUG_LOGGING"]["source_label"] == ".env"
-    assert field_map["GLM5_MODEL"]["source_label"] == "默认值"
+    assert field_map["API_ENDPOINT"]["source_label"] == "数据库"
+    assert field_map["TOOL_SUPPORT"]["source_label"] == "数据库"
+    assert field_map["AUTH_TOKEN"]["source_label"] == "环境变量"
     assert field_map["ADMIN_PASSWORD"]["sensitive"] is True
 
 
 @pytest.mark.asyncio
-async def test_save_form_config_preserves_unmanaged_lines_and_updates_fields(
+async def test_save_form_config_persists_runtime_settings_to_database(
     tmp_path,
+    monkeypatch,
 ):
-    env_path = tmp_path / ".env"
-    env_path.write_text(
-        "CUSTOM_FLAG=keep\nSERVICE_NAME=old-service\n",
-        encoding="utf-8",
+    runtime_dao = RuntimeConfigDAO(str(tmp_path / "runtime_config.db"))
+    monkeypatch.setattr(
+        config_manager,
+        "get_runtime_config_dao",
+        lambda: runtime_dao,
     )
 
     reloaded = False
@@ -119,94 +118,97 @@ async def test_save_form_config_preserves_unmanaged_lines_and_updates_fields(
         reloaded = True
 
     payload = _build_form_payload(
-        SERVICE_NAME="new-service",
-        LISTEN_PORT=9090,
-        ROOT_PATH="/edge",
-        DEBUG_LOGGING=False,
-        TOKEN_AUTO_IMPORT_ENABLED=True,
-        TOKEN_AUTO_IMPORT_SOURCE_DIR="/srv/tokens",
-        HTTP_PROXY="http://127.0.0.1:7890",
-        ADMIN_PASSWORD="new-admin-password",
+        API_ENDPOINT="https://db.example.com/v2/chat",
+        TOOL_SUPPORT=False,
+        TOKEN_AUTO_MAINTENANCE_ENABLED=True,
+        TOKEN_AUTO_MAINTENANCE_INTERVAL=900,
+        SERVICE_NAME="should-be-ignored",
+        ADMIN_PASSWORD="should-also-be-ignored",
     )
 
     updates = await save_form_config(
         payload,
         reload_callback=fake_reload,
-        env_path=env_path,
     )
-    content = env_path.read_text(encoding="utf-8")
+    stored = await runtime_dao.get_settings()
 
     assert reloaded is True
-    assert updates["SERVICE_NAME"] == "new-service"
-    assert updates["LISTEN_PORT"] == 9090
-    assert updates["TOKEN_AUTO_IMPORT_ENABLED"] is True
-    assert "CUSTOM_FLAG=keep" in content
-    assert "SERVICE_NAME=new-service" in content
-    assert "LISTEN_PORT=9090" in content
-    assert "ROOT_PATH=/edge" in content
-    assert "TOKEN_AUTO_IMPORT_ENABLED=true" in content
-    assert "TOKEN_AUTO_IMPORT_SOURCE_DIR=/srv/tokens" in content
-    assert "HTTP_PROXY=http://127.0.0.1:7890" in content
+    assert updates["API_ENDPOINT"] == "https://db.example.com/v2/chat"
+    assert updates["TOOL_SUPPORT"] is False
+    assert updates["TOKEN_AUTO_MAINTENANCE_ENABLED"] is True
+    assert updates["TOKEN_AUTO_MAINTENANCE_INTERVAL"] == 900
+    assert "SERVICE_NAME" not in updates
+    assert "ADMIN_PASSWORD" not in updates
+    assert stored["API_ENDPOINT"] == "https://db.example.com/v2/chat"
+    assert stored["TOOL_SUPPORT"] == "False"
+    assert stored["TOKEN_AUTO_MAINTENANCE_ENABLED"] == "True"
+    assert stored["TOKEN_AUTO_MAINTENANCE_INTERVAL"] == "900"
+    assert "SERVICE_NAME" not in stored
+    assert "ADMIN_PASSWORD" not in stored
 
 
-@pytest.mark.asyncio
-async def test_save_source_config_rolls_back_file_when_reload_fails(tmp_path):
-    env_path = tmp_path / ".env"
-    env_path.write_text("SERVICE_NAME=old-service\n", encoding="utf-8")
+def test_build_form_updates_rejects_short_vercel_maintenance_interval(
+    monkeypatch,
+):
+    monkeypatch.setenv("VERCEL", "1")
 
-    async def failing_reload():
-        raise RuntimeError("reload failed")
-
-    with pytest.raises(RuntimeError, match="reload failed"):
-        await save_source_config(
-            "SERVICE_NAME=new-service\nLISTEN_PORT=8081\n",
-            reload_callback=failing_reload,
-            env_path=env_path,
+    with pytest.raises(ValueError, match="300"):
+        build_form_updates(
+            _build_form_payload(
+                TOKEN_AUTO_MAINTENANCE_INTERVAL=299,
+            )
         )
 
-    assert env_path.read_text(encoding="utf-8") == "SERVICE_NAME=old-service\n"
+
+@pytest.mark.asyncio
+async def test_save_source_config_raises_migration_error():
+    with pytest.raises(RuntimeError, match="数据库运行时配置"):
+        await save_source_config("SERVICE_NAME=new-service\n")
 
 
 @pytest.mark.asyncio
-async def test_save_config_endpoint_returns_refresh_trigger(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env").write_text("SERVICE_NAME=before\n", encoding="utf-8")
+async def test_save_config_endpoint_returns_refresh_trigger_and_persists_to_db(
+    tmp_path,
+    monkeypatch,
+):
+    runtime_dao = RuntimeConfigDAO(str(tmp_path / "runtime_config.db"))
+    monkeypatch.setattr(
+        config_manager,
+        "get_runtime_config_dao",
+        lambda: runtime_dao,
+    )
+
+    reloaded = False
 
     async def fake_reload():
-        return None
+        nonlocal reloaded
+        reloaded = True
 
     monkeypatch.setattr(admin_api, "reload_settings", fake_reload)
 
     request = _make_form_request(
         "/admin/api/config/save",
         _build_form_payload(
-            SERVICE_NAME="after",
-            LISTEN_PORT=8081,
-            DEBUG_LOGGING=True,
+            API_ENDPOINT="https://after.example.com/v1/chat",
+            TOKEN_AUTO_MAINTENANCE_INTERVAL=1200,
         ),
     )
     response = await admin_api.save_config(request)
     body = response.body.decode("utf-8")
+    stored = await runtime_dao.get_settings(
+        ["API_ENDPOINT", "TOKEN_AUTO_MAINTENANCE_INTERVAL"]
+    )
 
     assert response.status_code == 200
     assert response.headers["HX-Trigger"] == "admin-config-refresh"
     assert "保存成功" in body
-    assert "SERVICE_NAME=after" in (tmp_path / ".env").read_text(encoding="utf-8")
+    assert reloaded is True
+    assert stored["API_ENDPOINT"] == "https://after.example.com/v1/chat"
+    assert stored["TOKEN_AUTO_MAINTENANCE_INTERVAL"] == "1200"
 
 
 @pytest.mark.asyncio
-async def test_save_config_source_endpoint_rejects_invalid_source(
-    tmp_path,
-    monkeypatch,
-):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env").write_text("SERVICE_NAME=before\n", encoding="utf-8")
-
-    async def fake_reload():
-        return None
-
-    monkeypatch.setattr(admin_api, "reload_settings", fake_reload)
-
+async def test_save_config_source_endpoint_returns_gone_notice():
     request = _make_form_request(
         "/admin/api/config/source",
         {"env_content": "SERVICE_NAME=after\nnot-valid-line\n"},
@@ -214,14 +216,23 @@ async def test_save_config_source_endpoint_rejects_invalid_source(
     response = await admin_api.save_config_source(request)
     body = response.body.decode("utf-8")
 
-    assert response.status_code == 400
-    assert "KEY=VALUE" in body
-    assert (tmp_path / ".env").read_text(encoding="utf-8") == "SERVICE_NAME=before\n"
+    assert response.status_code == 410
+    assert "数据库运行时配置" in body
+    assert ".env" in body
 
 
-def test_validate_env_source_rejects_invalid_lines():
-    with pytest.raises(ValueError, match="KEY=VALUE"):
+def test_validate_env_source_always_rejects_direct_env_editing():
+    with pytest.raises(ValueError, match="数据库运行时配置"):
         validate_env_source("SERVICE_NAME=ok\nbad line\n")
+
+
+@pytest.mark.asyncio
+async def test_env_preview_returns_migration_notice():
+    response = await admin_api.get_env_preview()
+    body = response.body.decode("utf-8")
+
+    assert response.status_code == 200
+    assert "不再支持在线编辑 .env" in body
 
 
 def test_config_template_compiles():

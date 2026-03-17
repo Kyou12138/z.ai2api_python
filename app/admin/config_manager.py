@@ -1,23 +1,16 @@
-"""Admin config metadata and helpers for the configuration console."""
+"""管理后台配置元数据与运行时配置存储辅助函数。"""
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Mapping
 
-from dotenv import dotenv_values
-
-from app.core.config import settings
-from app.utils.env_file import update_env_file
-from app.utils.logger import logger
-
-ENV_PATH = Path(".env")
-ENV_EXAMPLE_PATH = Path(".env.example")
-_ENV_SOURCE_LINE_PATTERN = re.compile(
-    r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=.*$"
+from app.core.config import (
+    RUNTIME_MANAGED_KEYS,
+    get_runtime_setting_overrides,
+    settings,
 )
+from app.services.runtime_config_dao import get_runtime_config_dao
 
 
 @dataclass(frozen=True)
@@ -32,9 +25,10 @@ class ConfigFieldSpec:
     required: bool = False
     wide: bool = False
     sensitive: bool = False
-    restart_required: bool = False
+    editable: bool = True
     min_value: int | None = None
     max_value: int | None = None
+    storage_kind: str = "runtime"
 
 
 @dataclass(frozen=True)
@@ -45,11 +39,29 @@ class ConfigSectionSpec:
     fields: tuple[ConfigFieldSpec, ...]
 
 
+def _field(
+    key: str,
+    label: str,
+    description: str,
+    value_type: str,
+    default_value: object,
+    **kwargs,
+) -> ConfigFieldSpec:
+    return ConfigFieldSpec(
+        key=key,
+        label=label,
+        description=description,
+        value_type=value_type,
+        default_value=default_value,
+        **kwargs,
+    )
+
+
 CONFIG_SECTIONS: tuple[ConfigSectionSpec, ...] = (
     ConfigSectionSpec(
         id="access",
-        title="接入与认证",
-        description="控制上游接口地址、客户端鉴权和 Function Call 行为。",
+        title="接入与行为",
+        description="数据库持久化的运行时配置，保存后会立即重载到当前实例。",
         fields=(
             ConfigFieldSpec(
                 key="API_ENDPOINT",
@@ -65,13 +77,15 @@ CONFIG_SECTIONS: tuple[ConfigSectionSpec, ...] = (
             ConfigFieldSpec(
                 key="AUTH_TOKEN",
                 label="客户端认证密钥",
-                description="客户端访问本服务时使用的 Bearer Token。",
+                description="敏感配置，改为通过平台环境变量管理。",
                 value_type="str",
                 default_value="sk-your-api-key",
                 input_type="password",
                 placeholder="sk-your-api-key",
                 wide=True,
                 sensitive=True,
+                editable=False,
+                storage_kind="env",
             ),
             ConfigFieldSpec(
                 key="SKIP_AUTH_TOKEN",
@@ -101,31 +115,39 @@ CONFIG_SECTIONS: tuple[ConfigSectionSpec, ...] = (
     ),
     ConfigSectionSpec(
         id="server",
-        title="服务运行",
-        description="服务监听、日志、数据库路径和反向代理前缀。",
+        title="平台与运行时",
+        description="这些字段由平台环境变量控制，后台仅做只读展示。",
         fields=(
+            ConfigFieldSpec(
+                key="DATABASE_URL",
+                label="数据库连接串",
+                description="Vercel / 外部数据库连接串，仅可通过环境变量配置。",
+                value_type="str",
+                default_value="",
+                input_type="password",
+                wide=True,
+                sensitive=True,
+                editable=False,
+                storage_kind="env",
+            ),
             ConfigFieldSpec(
                 key="SERVICE_NAME",
                 label="服务名称",
-                description="显示在进程列表中的服务名称。",
+                description="本地进程名称或标识，Vercel 上仅作展示。",
                 value_type="str",
                 default_value="api-proxy-server",
-                placeholder="api-proxy-server",
-                required=True,
-                restart_required=True,
+                editable=False,
+                storage_kind="env",
             ),
             ConfigFieldSpec(
                 key="LISTEN_PORT",
                 label="监听端口",
-                description="HTTP 服务监听端口。",
+                description="本地运行端口，Vercel 上由平台接管。",
                 value_type="int",
                 default_value=8080,
                 input_type="number",
-                min_value=1,
-                max_value=65535,
-                required=True,
-                restart_required=True,
-                placeholder="8080",
+                editable=False,
+                storage_kind="env",
             ),
             ConfigFieldSpec(
                 key="ROOT_PATH",
@@ -134,32 +156,24 @@ CONFIG_SECTIONS: tuple[ConfigSectionSpec, ...] = (
                 value_type="str",
                 default_value="",
                 placeholder="/api",
-                restart_required=True,
+                editable=False,
+                storage_kind="env",
             ),
             ConfigFieldSpec(
                 key="DEBUG_LOGGING",
-                label="启用调试日志",
-                description="开启后会输出更详细的调试信息。",
+                label="调试日志",
+                description="是否输出更详细的控制台日志。",
                 value_type="bool",
                 default_value=False,
-            ),
-            ConfigFieldSpec(
-                key="DB_PATH",
-                label="数据库路径",
-                description="SQLite 数据库文件位置。",
-                value_type="str",
-                default_value="tokens.db",
-                placeholder="tokens.db",
-                required=True,
-                wide=True,
-                restart_required=True,
+                editable=False,
+                storage_kind="env",
             ),
         ),
     ),
     ConfigSectionSpec(
         id="tokens",
         title="Token 池策略",
-        description="失败判定、恢复时间和自动导入、自动维护计划任务。",
+        description="目录自动导入已移除，仅保留数据库驱动的维护策略。",
         fields=(
             ConfigFieldSpec(
                 key="TOKEN_FAILURE_THRESHOLD",
@@ -170,7 +184,6 @@ CONFIG_SECTIONS: tuple[ConfigSectionSpec, ...] = (
                 input_type="number",
                 min_value=1,
                 required=True,
-                restart_required=True,
             ),
             ConfigFieldSpec(
                 key="TOKEN_RECOVERY_TIMEOUT",
@@ -181,45 +194,18 @@ CONFIG_SECTIONS: tuple[ConfigSectionSpec, ...] = (
                 input_type="number",
                 min_value=1,
                 required=True,
-                restart_required=True,
-            ),
-            ConfigFieldSpec(
-                key="TOKEN_AUTO_IMPORT_ENABLED",
-                label="启用自动导入",
-                description="按固定周期扫描服务端目录并导入 Token。",
-                value_type="bool",
-                default_value=False,
-            ),
-            ConfigFieldSpec(
-                key="TOKEN_AUTO_IMPORT_SOURCE_DIR",
-                label="自动导入目录",
-                description="服务端本地目录，开启自动导入时需要可访问。",
-                value_type="str",
-                default_value="",
-                placeholder="E:\\tokens\\input",
-                wide=True,
-            ),
-            ConfigFieldSpec(
-                key="TOKEN_AUTO_IMPORT_INTERVAL",
-                label="自动导入间隔（秒）",
-                description="自动导入的扫描周期。",
-                value_type="int",
-                default_value=300,
-                input_type="number",
-                min_value=1,
-                required=True,
             ),
             ConfigFieldSpec(
                 key="TOKEN_AUTO_MAINTENANCE_ENABLED",
                 label="启用自动维护",
-                description="定时执行去重、健康检查和删除失效 Token。",
+                description="由 Vercel Cron 定时触发执行维护逻辑。",
                 value_type="bool",
                 default_value=False,
             ),
             ConfigFieldSpec(
                 key="TOKEN_AUTO_MAINTENANCE_INTERVAL",
                 label="自动维护间隔（秒）",
-                description="自动维护的执行周期。",
+                description="Cron 入口最短执行间隔；Vercel 模式下最低 300 秒。",
                 value_type="int",
                 default_value=1800,
                 input_type="number",
@@ -251,8 +237,8 @@ CONFIG_SECTIONS: tuple[ConfigSectionSpec, ...] = (
     ),
     ConfigSectionSpec(
         id="guest",
-        title="匿名 Guest 会话池",
-        description="没有用户 Token 时，仅控制是否启用匿名池和池容量。",
+        title="匿名会话策略",
+        description="Vercel 上不再预热长驻池，仅保留按请求懒获取的容量配置。",
         fields=(
             ConfigFieldSpec(
                 key="ANONYMOUS_MODE",
@@ -260,114 +246,102 @@ CONFIG_SECTIONS: tuple[ConfigSectionSpec, ...] = (
                 description="无可用用户 Token 时允许使用匿名会话。",
                 value_type="bool",
                 default_value=True,
-                restart_required=True,
             ),
             ConfigFieldSpec(
                 key="GUEST_POOL_SIZE",
-                label="Guest 池容量",
-                description="启动和维持的 guest 会话数量。",
+                label="Guest 池目标容量",
+                description="用于限制单实例匿名会话补齐规模。",
                 value_type="int",
                 default_value=3,
                 input_type="number",
                 min_value=1,
                 required=True,
-                restart_required=True,
             ),
         ),
     ),
     ConfigSectionSpec(
         id="models",
         title="模型映射",
-        description="映射 OpenAI 兼容模型名到上游 Z.AI 实际模型名。",
+        description="映射 OpenAI / Claude 兼容模型名到上游 Z.AI 实际模型名。",
         fields=(
-            ConfigFieldSpec(
-                key="GLM45_MODEL",
-                label="GLM 4.5",
-                description="标准 GLM 4.5 模型标识。",
-                value_type="str",
-                default_value="GLM-4.5",
-                placeholder="GLM-4.5",
+            _field(
+                "GLM45_MODEL",
+                "GLM 4.5",
+                "标准 GLM 4.5 模型标识。",
+                "str",
+                "GLM-4.5",
                 required=True,
             ),
-            ConfigFieldSpec(
-                key="GLM45_THINKING_MODEL",
-                label="GLM 4.5 Thinking",
-                description="推理增强版 GLM 4.5 模型标识。",
-                value_type="str",
-                default_value="GLM-4.5-Thinking",
-                placeholder="GLM-4.5-Thinking",
+            _field(
+                "GLM45_THINKING_MODEL",
+                "GLM 4.5 Thinking",
+                "推理增强版 GLM 4.5 模型标识。",
+                "str",
+                "GLM-4.5-Thinking",
                 required=True,
             ),
-            ConfigFieldSpec(
-                key="GLM45_SEARCH_MODEL",
-                label="GLM 4.5 Search",
-                description="搜索增强版 GLM 4.5 模型标识。",
-                value_type="str",
-                default_value="GLM-4.5-Search",
-                placeholder="GLM-4.5-Search",
+            _field(
+                "GLM45_SEARCH_MODEL",
+                "GLM 4.5 Search",
+                "搜索增强版 GLM 4.5 模型标识。",
+                "str",
+                "GLM-4.5-Search",
                 required=True,
             ),
-            ConfigFieldSpec(
-                key="GLM45_AIR_MODEL",
-                label="GLM 4.5 Air",
-                description="轻量版 GLM 4.5 模型标识。",
-                value_type="str",
-                default_value="GLM-4.5-Air",
-                placeholder="GLM-4.5-Air",
+            _field(
+                "GLM45_AIR_MODEL",
+                "GLM 4.5 Air",
+                "轻量版 GLM 4.5 模型标识。",
+                "str",
+                "GLM-4.5-Air",
                 required=True,
             ),
-            ConfigFieldSpec(
-                key="GLM46V_MODEL",
-                label="GLM 4.6V",
-                description="视觉模型标识。",
-                value_type="str",
-                default_value="GLM-4.6V",
-                placeholder="GLM-4.6V",
+            _field(
+                "GLM46V_MODEL",
+                "GLM 4.6V",
+                "视觉模型标识。",
+                "str",
+                "GLM-4.6V",
                 required=True,
             ),
-            ConfigFieldSpec(
-                key="GLM5_MODEL",
-                label="GLM 5",
-                description="GLM 5 模型标识。",
-                value_type="str",
-                default_value="GLM-5",
-                placeholder="GLM-5",
+            _field(
+                "GLM5_MODEL",
+                "GLM 5",
+                "GLM 5 模型标识。",
+                "str",
+                "GLM-5",
                 required=True,
             ),
-            ConfigFieldSpec(
-                key="GLM47_MODEL",
-                label="GLM 4.7",
-                description="GLM 4.7 主模型标识。",
-                value_type="str",
-                default_value="GLM-4.7",
-                placeholder="GLM-4.7",
+            _field(
+                "GLM47_MODEL",
+                "GLM 4.7",
+                "GLM 4.7 主模型标识。",
+                "str",
+                "GLM-4.7",
                 required=True,
             ),
-            ConfigFieldSpec(
-                key="GLM47_THINKING_MODEL",
-                label="GLM 4.7 Thinking",
-                description="GLM 4.7 推理版模型标识。",
-                value_type="str",
-                default_value="GLM-4.7-Thinking",
-                placeholder="GLM-4.7-Thinking",
+            _field(
+                "GLM47_THINKING_MODEL",
+                "GLM 4.7 Thinking",
+                "GLM 4.7 推理版模型标识。",
+                "str",
+                "GLM-4.7-Thinking",
                 required=True,
             ),
-            ConfigFieldSpec(
-                key="GLM47_SEARCH_MODEL",
-                label="GLM 4.7 Search",
-                description="GLM 4.7 搜索版模型标识。",
-                value_type="str",
-                default_value="GLM-4.7-Search",
-                placeholder="GLM-4.7-Search",
+            _field(
+                "GLM47_SEARCH_MODEL",
+                "GLM 4.7 Search",
+                "GLM 4.7 搜索版模型标识。",
+                "str",
+                "GLM-4.7-Search",
                 required=True,
             ),
-            ConfigFieldSpec(
-                key="GLM47_ADVANCED_SEARCH_MODEL",
-                label="GLM 4.7 Advanced Search",
-                description="GLM 4.7 高级搜索模型标识。",
-                value_type="str",
-                default_value="GLM-4.7-advanced-search",
-                placeholder="GLM-4.7-advanced-search",
+            _field(
+                "GLM47_ADVANCED_SEARCH_MODEL",
+                "GLM 4.7 Advanced Search",
+                "GLM 4.7 高级搜索模型标识。",
+                "str",
+                "GLM-4.7-advanced-search",
                 required=True,
                 wide=True,
             ),
@@ -375,65 +349,76 @@ CONFIG_SECTIONS: tuple[ConfigSectionSpec, ...] = (
     ),
     ConfigSectionSpec(
         id="proxy",
-        title="代理网络",
-        description="上游访问使用的 HTTP、HTTPS 和 SOCKS5 代理。",
+        title="代理与后台安全",
+        description="这些字段涉及网络出口与敏感凭证，统一通过环境变量托管。",
         fields=(
-            ConfigFieldSpec(
-                key="HTTP_PROXY",
-                label="HTTP 代理",
-                description="例如 http://127.0.0.1:7890。",
-                value_type="str",
-                default_value="",
+            _field(
+                "HTTP_PROXY",
+                "HTTP 代理",
+                "例如 http://127.0.0.1:7890。",
+                "str",
+                "",
                 placeholder="http://127.0.0.1:7890",
                 wide=True,
+                editable=False,
+                storage_kind="env",
             ),
-            ConfigFieldSpec(
-                key="HTTPS_PROXY",
-                label="HTTPS 代理",
-                description="例如 http://127.0.0.1:7890。",
-                value_type="str",
-                default_value="",
+            _field(
+                "HTTPS_PROXY",
+                "HTTPS 代理",
+                "例如 http://127.0.0.1:7890。",
+                "str",
+                "",
                 placeholder="http://127.0.0.1:7890",
                 wide=True,
+                editable=False,
+                storage_kind="env",
             ),
-            ConfigFieldSpec(
-                key="SOCKS5_PROXY",
-                label="SOCKS5 代理",
-                description="例如 socks5://127.0.0.1:1080。",
-                value_type="str",
-                default_value="",
+            _field(
+                "SOCKS5_PROXY",
+                "SOCKS5 代理",
+                "例如 socks5://127.0.0.1:1080。",
+                "str",
+                "",
                 placeholder="socks5://127.0.0.1:1080",
                 wide=True,
+                editable=False,
+                storage_kind="env",
             ),
-        ),
-    ),
-    ConfigSectionSpec(
-        id="admin",
-        title="后台安全",
-        description="管理后台密码和会话密钥。修改后建议重新登录。",
-        fields=(
-            ConfigFieldSpec(
-                key="ADMIN_PASSWORD",
-                label="后台密码",
-                description="管理后台登录密码。",
-                value_type="str",
-                default_value="admin123",
+            _field(
+                "ADMIN_PASSWORD",
+                "后台密码",
+                "后台登录密码，仅可通过环境变量配置。",
+                "str",
+                "admin123",
                 input_type="password",
-                placeholder="admin123",
-                required=True,
                 sensitive=True,
+                editable=False,
+                storage_kind="env",
             ),
-            ConfigFieldSpec(
-                key="SESSION_SECRET_KEY",
-                label="会话密钥",
-                description="用于后台会话签名的密钥。",
-                value_type="str",
-                default_value="your-secret-key-change-in-production",
+            _field(
+                "SESSION_SECRET_KEY",
+                "会话密钥",
+                "用于后台 Cookie 签名的密钥，仅可通过环境变量配置。",
+                "str",
+                "",
                 input_type="password",
-                placeholder="your-secret-key-change-in-production",
-                required=True,
                 sensitive=True,
                 wide=True,
+                editable=False,
+                storage_kind="env",
+            ),
+            _field(
+                "CRON_SECRET",
+                "Cron 密钥",
+                "保护内部维护入口的 Bearer 密钥，仅可通过环境变量配置。",
+                "str",
+                "",
+                input_type="password",
+                sensitive=True,
+                wide=True,
+                editable=False,
+                storage_kind="env",
             ),
         ),
     ),
@@ -444,64 +429,69 @@ CONFIG_FIELD_SPECS = {
     for section in CONFIG_SECTIONS
     for field in section.fields
 }
-MANAGED_ENV_KEYS = tuple(CONFIG_FIELD_SPECS.keys())
-ReloadCallback = Callable[[], Awaitable[None]]
 
 
-def read_env_content(env_path: str | Path = ENV_PATH) -> str:
-    path = Path(env_path)
-    if not path.exists():
-        return ""
-    return path.read_text(encoding="utf-8")
+def read_env_content(*args, **kwargs) -> str:
+    """兼容旧入口：数据库配置模式下不再直接编辑 .env。"""
+    return "# 当前版本已迁移为数据库运行时配置，不再支持在线编辑 .env。"
 
 
 def validate_env_source(content: str) -> str:
-    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    """兼容旧入口：不再允许直接保存 .env。"""
+    raise ValueError("当前版本已迁移为数据库运行时配置，不再支持直接编辑 .env。")
 
-    for line_number, line in enumerate(normalized.splitlines(), start=1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if not _ENV_SOURCE_LINE_PATTERN.match(line):
-            raise ValueError(
-                f"第 {line_number} 行不是合法的 KEY=VALUE 格式。"
-            )
 
-    return normalized
+def _build_source_badge(
+    field: ConfigFieldSpec,
+    runtime_overrides: Mapping[str, str],
+) -> tuple[str, str]:
+    if field.storage_kind == "env":
+        return (
+            "环境变量",
+            "bg-blue-50 text-blue-700 ring-blue-200",
+        )
+    if field.key in runtime_overrides:
+        return (
+            "数据库",
+            "bg-emerald-50 text-emerald-700 ring-emerald-200",
+        )
+    return (
+        "默认值",
+        "bg-slate-100 text-slate-600 ring-slate-200",
+    )
 
 
 def build_config_page_data(
     *,
     settings_obj: Any = settings,
-    env_path: str | Path = ENV_PATH,
-    env_example_path: str | Path = ENV_EXAMPLE_PATH,
+    runtime_overrides: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    env_file = Path(env_path)
-    env_content = read_env_content(env_file)
-    env_values = dotenv_values(env_file) if env_file.exists() else {}
+    overrides = dict(runtime_overrides or get_runtime_setting_overrides())
     sections: list[dict[str, Any]] = []
     total_fields = 0
-    overridden_fields = 0
+    editable_fields = 0
+    env_fields = 0
+    database_overrides = 0
     sensitive_fields = 0
-    restart_required_fields = 0
 
     for section in CONFIG_SECTIONS:
         rendered_fields: list[dict[str, Any]] = []
         for field in section.fields:
             total_fields += 1
+            if field.editable:
+                editable_fields += 1
             if field.sensitive:
                 sensitive_fields += 1
-            if field.restart_required:
-                restart_required_fields += 1
-
-            is_overridden = field.key in env_values
-            if is_overridden:
-                overridden_fields += 1
+            if field.storage_kind == "env":
+                env_fields += 1
+            if field.key in overrides:
+                database_overrides += 1
 
             value = getattr(settings_obj, field.key, field.default_value)
             if value is None:
                 value = ""
 
+            source_label, source_badge_class = _build_source_badge(field, overrides)
             rendered_fields.append(
                 {
                     "key": field.key,
@@ -514,15 +504,12 @@ def build_config_page_data(
                     "required": field.required,
                     "wide": field.wide,
                     "sensitive": field.sensitive,
-                    "restart_required": field.restart_required,
+                    "editable": field.editable,
+                    "storage_kind": field.storage_kind,
                     "min_value": field.min_value,
                     "max_value": field.max_value,
-                    "source_label": ".env" if is_overridden else "默认值",
-                    "source_badge_class": (
-                        "bg-emerald-50 text-emerald-700 ring-emerald-200"
-                        if is_overridden
-                        else "bg-slate-100 text-slate-600 ring-slate-200"
-                    ),
+                    "source_label": source_label,
+                    "source_badge_class": source_badge_class,
                 }
             )
 
@@ -538,18 +525,17 @@ def build_config_page_data(
 
     return {
         "sections": sections,
-        "env_content": env_content,
         "overview": {
             "total_sections": len(CONFIG_SECTIONS),
             "total_fields": total_fields,
-            "overridden_fields": overridden_fields,
-            "default_fields": total_fields - overridden_fields,
+            "editable_fields": editable_fields,
+            "readonly_fields": total_fields - editable_fields,
+            "database_overrides": database_overrides,
+            "default_fields": total_fields - database_overrides - env_fields,
+            "env_fields": env_fields,
             "sensitive_fields": sensitive_fields,
-            "restart_required_fields": restart_required_fields,
-            "env_exists": env_file.exists(),
-            "env_path": str(env_file.resolve()),
-            "env_line_count": len(env_content.splitlines()) if env_content else 0,
-            "example_exists": Path(env_example_path).exists(),
+            "runtime_storage": "PostgreSQL" if settings_obj.uses_postgres else "SQLite",
+            "is_vercel": settings_obj.is_vercel,
         },
     }
 
@@ -557,8 +543,10 @@ def build_config_page_data(
 def build_form_updates(form_data: Mapping[str, Any]) -> dict[str, object]:
     updates: dict[str, object] = {}
 
-    for key in MANAGED_ENV_KEYS:
+    for key in RUNTIME_MANAGED_KEYS:
         field = CONFIG_FIELD_SPECS[key]
+        if not field.editable:
+            continue
 
         if field.value_type == "bool":
             updates[key] = key in form_data
@@ -575,13 +563,15 @@ def build_form_updates(form_data: Mapping[str, Any]) -> dict[str, object]:
                 raise ValueError(f"{field.label} 必须是整数。") from exc
 
             if field.min_value is not None and parsed < field.min_value:
-                raise ValueError(
-                    f"{field.label} 不能小于 {field.min_value}。"
-                )
+                raise ValueError(f"{field.label} 不能小于 {field.min_value}。")
             if field.max_value is not None and parsed > field.max_value:
-                raise ValueError(
-                    f"{field.label} 不能大于 {field.max_value}。"
-                )
+                raise ValueError(f"{field.label} 不能大于 {field.max_value}。")
+            if (
+                settings.is_vercel
+                and key == "TOKEN_AUTO_MAINTENANCE_INTERVAL"
+                and parsed < 300
+            ):
+                raise ValueError("Vercel 模式下自动维护间隔不能小于 300 秒。")
             updates[key] = parsed
             continue
 
@@ -590,93 +580,21 @@ def build_form_updates(form_data: Mapping[str, Any]) -> dict[str, object]:
     return updates
 
 
-async def _apply_env_change(
-    writer: Callable[[Path], None],
-    *,
-    reload_callback: ReloadCallback,
-    env_path: str | Path = ENV_PATH,
-) -> None:
-    path = Path(env_path)
-    had_existing_file = path.exists()
-    previous_content = read_env_content(path) if had_existing_file else ""
-
-    try:
-        writer(path)
-        await reload_callback()
-    except Exception:
-        if had_existing_file:
-            path.write_text(previous_content, encoding="utf-8")
-        elif path.exists():
-            path.unlink()
-
-        try:
-            await reload_callback()
-        except Exception as restore_exc:
-            logger.warning(f"⚠️ 回滚配置后重新加载失败: {restore_exc}")
-        raise
-
-
 async def save_form_config(
     form_data: Mapping[str, Any],
     *,
-    reload_callback: ReloadCallback,
-    env_path: str | Path = ENV_PATH,
+    reload_callback,
 ) -> dict[str, object]:
     updates = build_form_updates(form_data)
-
-    async def _reload() -> None:
-        await reload_callback()
-
-    def _writer(target_path: Path) -> None:
-        update_env_file(updates, env_path=target_path)
-
-    await _apply_env_change(_writer, reload_callback=_reload, env_path=env_path)
+    dao = get_runtime_config_dao()
+    await dao.upsert_settings(updates)
+    await reload_callback()
     return updates
 
 
-async def save_source_config(
-    env_content: str,
-    *,
-    reload_callback: ReloadCallback,
-    env_path: str | Path = ENV_PATH,
-) -> None:
-    normalized = validate_env_source(env_content)
-
-    def _writer(target_path: Path) -> None:
-        content = normalized.rstrip("\n")
-        target_path.write_text(
-            f"{content}\n" if content else "",
-            encoding="utf-8",
-        )
-
-    await _apply_env_change(
-        _writer,
-        reload_callback=reload_callback,
-        env_path=env_path,
-    )
+async def save_source_config(*args, **kwargs) -> None:
+    raise RuntimeError("当前版本已迁移为数据库运行时配置，不再支持直接编辑 .env。")
 
 
-async def reset_env_to_example(
-    *,
-    reload_callback: ReloadCallback,
-    env_path: str | Path = ENV_PATH,
-    env_example_path: str | Path = ENV_EXAMPLE_PATH,
-) -> None:
-    example_path = Path(env_example_path)
-    if not example_path.exists():
-        raise FileNotFoundError(".env.example 不存在")
-
-    example_content = example_path.read_text(encoding="utf-8")
-
-    def _writer(target_path: Path) -> None:
-        content = example_content.rstrip("\n")
-        target_path.write_text(
-            f"{content}\n" if content else "",
-            encoding="utf-8",
-        )
-
-    await _apply_env_change(
-        _writer,
-        reload_callback=reload_callback,
-        env_path=env_path,
-    )
+async def reset_env_to_example(*args, **kwargs) -> None:
+    raise RuntimeError("当前版本已迁移为数据库运行时配置，不再支持重置 .env.example。")

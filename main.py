@@ -4,6 +4,7 @@
 import os
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,14 +13,20 @@ from granian import Granian
 
 from app.admin import api as admin_api
 from app.admin import routes as admin_routes
-from app.core import claude, openai
-from app.core.config import settings
+from app.core import claude, internal, openai
+from app.core.config import reload_settings_from_sources, settings
 from app.core.upstream import UpstreamClient
+from app.services.postgres_backend import close_postgres_pool
+from app.services.request_log_dao import init_request_log_dao
+from app.services.runtime_config_dao import init_runtime_config_storage
 from app.utils.logger import setup_logger
 from app.utils.reload_config import RELOAD_CONFIG
 
-# Setup logger
-logger = setup_logger(log_dir="logs", debug_mode=settings.DEBUG_LOGGING)
+logger = setup_logger(
+    log_dir="logs",
+    debug_mode=settings.DEBUG_LOGGING,
+    enable_file_logging=settings.allow_file_logging,
+)
 
 
 async def warmup_upstream_client():
@@ -35,20 +42,28 @@ async def warmup_upstream_client():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 初始化 Token 数据库
-    from app.services.request_log_dao import init_request_log_dao
     from app.services.token_automation import (
         run_directory_import,
         start_token_automation_scheduler,
         stop_token_automation_scheduler,
     )
-    from app.services.token_dao import init_token_database
+    from app.services.token_dao import get_token_dao
+    from app.utils.token_pool import initialize_token_pool_from_db
 
-    await init_token_database()
-    init_request_log_dao()
+    await init_runtime_config_storage()
+    await get_token_dao().init_database()
+    request_log_dao = init_request_log_dao()
+    await request_log_dao.init_database()
+    await reload_settings_from_sources()
+    setup_logger(
+        log_dir="logs",
+        debug_mode=settings.DEBUG_LOGGING,
+        enable_file_logging=settings.allow_file_logging,
+    )
 
     if (
-        settings.TOKEN_AUTO_IMPORT_ENABLED
+        not settings.is_serverless
+        and settings.TOKEN_AUTO_IMPORT_ENABLED
         and settings.TOKEN_AUTO_IMPORT_SOURCE_DIR.strip()
     ):
         try:
@@ -60,9 +75,6 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning(f"⚠️ 启动阶段目录自动导入失败: {exc}")
 
-    # 从数据库初始化认证 token 池
-    from app.utils.token_pool import initialize_token_pool_from_db
-
     token_pool = await initialize_token_pool_from_db(
         provider="zai",
         failure_threshold=settings.TOKEN_FAILURE_THRESHOLD,
@@ -70,11 +82,9 @@ async def lifespan(app: FastAPI):
     )
 
     if not token_pool and not settings.ANONYMOUS_MODE:
-        logger.warning(
-            "⚠️ 未找到可用 Token 且未启用匿名模式，服务可能无法正常工作"
-        )
+        logger.warning("⚠️ 未找到可用 Token 且未启用匿名模式，服务可能无法正常工作")
 
-    if settings.ANONYMOUS_MODE:
+    if settings.ANONYMOUS_MODE and not settings.is_serverless:
         from app.utils.guest_session_pool import initialize_guest_session_pool
 
         guest_pool = await initialize_guest_session_pool(
@@ -86,62 +96,72 @@ async def lifespan(app: FastAPI):
             f"{guest_status.get('valid_sessions', 0)} 个可用会话"
         )
 
-    await warmup_upstream_client()
-    await start_token_automation_scheduler()
+    if not settings.is_serverless:
+        await warmup_upstream_client()
+        await start_token_automation_scheduler()
 
     yield
 
     logger.info("🔄 应用正在关闭...")
 
-    await stop_token_automation_scheduler()
+    if not settings.is_serverless:
+        await stop_token_automation_scheduler()
 
-    if settings.ANONYMOUS_MODE:
-        from app.utils.guest_session_pool import close_guest_session_pool
+        if settings.ANONYMOUS_MODE:
+            from app.utils.guest_session_pool import close_guest_session_pool
 
-        await close_guest_session_pool()
+            await close_guest_session_pool()
+
+    if settings.uses_postgres:
+        await close_postgres_pool()
 
 
-# Create FastAPI app with lifespan
-# root_path is used for reverse proxy path prefix (e.g., /api or /path-prefix)
-app = FastAPI(lifespan=lifespan, root_path=settings.ROOT_PATH)
+def _mount_static_files(app: FastAPI) -> None:
+    static_dir = Path("app/static")
+    if static_dir.exists():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+        return
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
-)
+    if settings.is_serverless:
+        logger.warning("⚠️ 未找到 app/static，Vercel 模式下跳过 /static 挂载")
+        return
 
-# 挂载web端静态文件目录
-try:
-    app.mount("/static", StaticFiles(directory="app/static"), name="static")
-except RuntimeError:
-    # 如果 static 目录不存在，创建它
     os.makedirs("app/static/css", exist_ok=True)
     os.makedirs("app/static/js", exist_ok=True)
     app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
-# Include API routers
-app.include_router(openai.router)
-app.include_router(claude.router)
 
-# Include admin routers
-app.include_router(admin_routes.router)
-app.include_router(admin_api.router)
+def create_app() -> FastAPI:
+    app = FastAPI(lifespan=lifespan, root_path=settings.ROOT_PATH)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization"],
+    )
+
+    _mount_static_files(app)
+
+    app.include_router(openai.router)
+    app.include_router(claude.router)
+    app.include_router(admin_routes.router)
+    app.include_router(admin_api.router)
+    app.include_router(internal.router)
+
+    @app.options("/")
+    async def handle_options():
+        return Response(status_code=200)
+
+    @app.get("/")
+    async def root():
+        return {"message": "OpenAI Compatible API Server"}
+
+    return app
 
 
-@app.options("/")
-async def handle_options():
-    """Handle OPTIONS requests"""
-    return Response(status_code=200)
-
-
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {"message": "OpenAI Compatible API Server"}
+app = create_app()
 
 
 def run_server():
@@ -158,14 +178,14 @@ def run_server():
             interface="asgi",
             address="0.0.0.0",
             port=settings.LISTEN_PORT,
-            reload=False,  # 生产环境请关闭热重载
-            process_name=service_name,  # 设置进程名称
-            **RELOAD_CONFIG,  # 热重载配置
+            reload=False,
+            process_name=service_name,
+            **RELOAD_CONFIG,
         ).serve()
     except KeyboardInterrupt:
         logger.info("🛑 收到中断信号，正在关闭服务...")
-    except Exception as e:
-        logger.error(f"❌ 服务启动失败: {e}")
+    except Exception as exc:
+        logger.error(f"❌ 服务启动失败: {exc}")
         sys.exit(1)
 
 

@@ -10,7 +10,10 @@ from typing import Dict, List, Optional
 
 import aiosqlite
 
+from app.core.config import settings
+from app.core.runtime_env import is_postgres_url
 from app.models.request_log import DB_PATH, SQL_CREATE_REQUEST_LOGS_TABLE
+from app.services.postgres_request_log_dao import PostgresRequestLogDAO
 from app.utils.logger import logger
 
 
@@ -63,6 +66,10 @@ class RequestLogDAO:
             logger.debug("请求日志表初始化成功")
         except Exception as e:
             logger.error(f"初始化请求日志表失败: {e}")
+
+    async def init_database(self):
+        """兼容统一初始化流程。"""
+        self._init_db()
 
     def _ensure_columns(self, conn: sqlite3.Connection):
         """为旧数据库补齐新增列。"""
@@ -619,12 +626,18 @@ def get_request_log_dao() -> RequestLogDAO:
     """
     global _request_log_dao
     if _request_log_dao is None:
-        _request_log_dao = RequestLogDAO()
+        if is_postgres_url(settings.normalized_database_url):
+            _request_log_dao = PostgresRequestLogDAO()
+        else:
+            _request_log_dao = RequestLogDAO()
     return _request_log_dao
 
 
 def init_request_log_dao():
     """初始化请求日志 DAO"""
     global _request_log_dao
-    _request_log_dao = RequestLogDAO()
+    if is_postgres_url(settings.normalized_database_url):
+        _request_log_dao = PostgresRequestLogDAO()
+    else:
+        _request_log_dao = RequestLogDAO()
     return _request_log_dao

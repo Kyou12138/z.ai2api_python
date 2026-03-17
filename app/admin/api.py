@@ -2,24 +2,28 @@
 管理后台 API 接口
 用于 htmx 调用的 HTML 片段返回
 """
+
+import re
 from datetime import datetime
 from html import escape
-from pathlib import Path
-import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
-from app.admin.auth import require_auth
+from app.admin.auth import (
+    create_session,
+    delete_session,
+    get_session_token_from_request,
+    require_auth,
+)
 from app.admin.config_manager import (
     read_env_content,
-    reset_env_to_example,
     save_form_config,
-    save_source_config,
 )
 from app.admin.stats import collect_admin_stats, normalize_trend_window
+from app.core.config import reload_settings_from_sources, settings
 from app.services.request_log_dao import get_request_log_dao
 from app.utils.logger import logger
 
@@ -33,8 +37,6 @@ DEFAULT_TOKEN_NAMESPACE = "zai"
 @router.post("/login")
 async def login(request: Request):
     """管理后台登录"""
-    from app.admin.auth import create_session
-
     try:
         data = await request.json()
         password = data.get("password", "")
@@ -53,7 +55,8 @@ async def login(request: Request):
                 value=session_token,
                 httponly=True,
                 max_age=86400,  # 24小时
-                samesite="lax"
+                samesite="lax",
+                secure=settings.is_vercel,
             )
             logger.info("✅ 管理后台登录成功")
             return response
@@ -76,8 +79,6 @@ async def login(request: Request):
 @router.post("/logout")
 async def logout(request: Request):
     """管理后台登出"""
-    from app.admin.auth import delete_session, get_session_token_from_request
-
     session_token = get_session_token_from_request(request)
     delete_session(session_token)
 
@@ -92,24 +93,14 @@ async def logout(request: Request):
 
 
 async def reload_settings():
-    """热重载配置（重新加载环境变量并更新 settings 对象）"""
-    from dotenv import load_dotenv
-
-    from app.core.config import settings
     from app.utils.logger import setup_logger
 
-    # 重新加载 .env 文件
-    load_dotenv(override=True)
-
-    # 重新创建 Settings 对象并更新全局配置
-    new_settings = type(settings)()
-
-    # 更新全局 settings 的所有属性
-    for field_name in new_settings.model_fields.keys():
-        setattr(settings, field_name, getattr(new_settings, field_name))
-
-    # 重新初始化 logger（使用新的 DEBUG_LOGGING 配置）
-    setup_logger(log_dir="logs", debug_mode=settings.DEBUG_LOGGING)
+    await reload_settings_from_sources()
+    setup_logger(
+        log_dir="logs",
+        debug_mode=settings.DEBUG_LOGGING,
+        enable_file_logging=settings.allow_file_logging,
+    )
 
     logger.info(f"🔄 配置已热重载 (DEBUG_LOGGING={settings.DEBUG_LOGGING})")
 
@@ -252,20 +243,11 @@ async def get_dashboard_usage_trend(request: Request):
     )
 
 
-def _validate_directory_path(source_dir: str) -> str:
-    if not source_dir:
-        raise ValueError("请先填写服务端可访问的本地目录路径。")
-
-    source_path = Path(source_dir).expanduser()
-    if not source_path.exists():
-        raise ValueError(f"导入目录不存在: {source_path}")
-    if not source_path.is_dir():
-        raise ValueError(f"导入路径不是目录: {source_path}")
-
-    return str(source_path)
-
-
-@router.get("/token-pool", response_class=HTMLResponse)
+@router.get(
+    "/token-pool",
+    response_class=HTMLResponse,
+    dependencies=[Depends(require_auth)],
+)
 async def get_token_pool_status(request: Request):
     """获取 Token 池状态（HTML 片段）"""
     from app.utils.token_pool import get_token_pool
@@ -302,8 +284,9 @@ async def get_token_pool_status(request: Request):
         # 格式化最后使用时间
         last_success = token_info.get("last_success_time", 0)
         if last_success > 0:
-            from datetime import datetime
-            last_used = datetime.fromtimestamp(last_success).strftime("%Y-%m-%d %H:%M:%S")
+            last_used = datetime.fromtimestamp(last_success).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
         else:
             last_used = "从未使用"
 
@@ -326,7 +309,11 @@ async def get_token_pool_status(request: Request):
     return templates.TemplateResponse("components/token_pool.html", context)
 
 
-@router.get("/recent-logs", response_class=HTMLResponse)
+@router.get(
+    "/recent-logs",
+    response_class=HTMLResponse,
+    dependencies=[Depends(require_auth)],
+)
 async def get_recent_logs(request: Request):
     """获取最近的请求日志（HTML 片段）"""
     dao = get_request_log_dao()
@@ -450,145 +437,57 @@ async def save_config(request: Request):
 
 @router.post("/config/source", dependencies=[Depends(require_auth)])
 async def save_config_source(request: Request):
-    """保存 .env 源文件并热重载。"""
-    try:
-        form_data = await request.form()
-        await save_source_config(
-            str(form_data.get("env_content", "")),
-            reload_callback=reload_settings,
-        )
-        logger.info("✅ 配置源文件已保存")
-        return _with_hx_trigger(
-            _build_alert(
-                ".env 源文件已保存并热重载，页面即将刷新。",
-                title="保存成功！",
-                level="success",
-            ),
-            "admin-config-refresh",
-        )
-    except ValueError as exc:
-        return _build_alert(
-            str(exc),
-            title="源文件校验失败！",
-            level="error",
-            status_code=400,
-        )
-    except Exception as exc:
-        logger.error(f"❌ 源文件保存失败: {exc}")
-        return _build_alert(
-            f"源文件保存失败: {exc}",
-            title="错误！",
-            level="error",
-            status_code=500,
-        )
+    """兼容旧入口：提示改用数据库配置。"""
+    return _build_alert(
+        "当前版本已迁移为数据库运行时配置，不再支持直接编辑 .env。",
+        title="入口已弃用",
+        level="warning",
+        status_code=410,
+    )
 
 
 @router.post("/config/reset", dependencies=[Depends(require_auth)])
 async def reset_config():
-    """将配置重置为 .env.example 并热重载。"""
-    try:
-        await reset_env_to_example(reload_callback=reload_settings)
-        logger.info("✅ 配置已重置为 .env.example 默认值")
-        return _with_hx_trigger(
-            _build_alert(
-                "配置已恢复为 .env.example 默认值，页面即将刷新。",
-                title="已重置！",
-                level="success",
-            ),
-            "admin-config-refresh",
-        )
-    except FileNotFoundError:
-        logger.error("❌ 未找到 .env.example，无法重置配置")
-        return _build_alert(
-            "未找到 .env.example，无法重置配置。",
-            title="错误！",
-            level="error",
-            status_code=404,
-        )
-    except Exception as exc:
-        logger.error(f"❌ 配置重置失败: {exc}")
-        return _build_alert(
-            f"重置失败: {exc}",
-            title="错误！",
-            level="error",
-            status_code=500,
-        )
+    """兼容旧入口：数据库配置模式下不支持 .env 重置。"""
+    return _build_alert(
+        "当前版本已迁移为数据库运行时配置，不再支持重置 .env.example。",
+        title="入口已弃用",
+        level="warning",
+        status_code=410,
+    )
 
 
 @router.get("/env-preview", dependencies=[Depends(require_auth)])
 async def get_env_preview():
-    """获取 .env 文件预览"""
-    try:
-        content = read_env_content()
-        if not content:
-            content = "# .env 文件不存在"
-        return HTMLResponse(f"<pre>{escape(content)}</pre>")
-    except Exception as exc:
-        return HTMLResponse(f"<pre># 读取失败: {escape(str(exc))}</pre>")
+    """兼容旧入口：展示环境变量管理说明。"""
+    content = read_env_content()
+    return HTMLResponse(f"<pre>{escape(content)}</pre>")
 
 
-@router.get("/live-logs", response_class=HTMLResponse)
+@router.get(
+    "/live-logs",
+    response_class=HTMLResponse,
+    dependencies=[Depends(require_auth)],
+)
 async def get_live_logs():
-    """获取实时日志（最新 50 行）"""
-    import os
-    from datetime import datetime
-
-    logs = []
-
-    # 尝试读取日志文件
-    log_dir = "logs"
-    if os.path.exists(log_dir):
-        log_files = sorted([f for f in os.listdir(log_dir) if f.endswith('.log')], reverse=True)
-        if log_files:
-            log_file = os.path.join(log_dir, log_files[0])
-            try:
-                with open(log_file, 'r', encoding='utf-8') as f:
-                    # 读取最后 50 行
-                    lines = f.readlines()[-50:]
-                    logs = lines
-            except Exception as e:
-                logs = [f"# [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 读取日志失败: {str(e)}"]
-
-    if not logs:
-        logs = [f"# [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 暂无日志数据"]
-
-    html = ""
-    for log in logs:
-        log_line = log.strip()
-        if not log_line:
-            continue
-
-        # 根据日志级别设置颜色和样式
-        if "ERROR" in log_line or "CRITICAL" in log_line:
-            color_class = "text-red-400 font-semibold"
-            icon = "❌"
-        elif "WARNING" in log_line or "WARN" in log_line:
-            color_class = "text-yellow-400"
-            icon = "⚠️"
-        elif "SUCCESS" in log_line or "✅" in log_line:
-            color_class = "text-green-400"
-            icon = "✅"
-        elif "INFO" in log_line:
-            color_class = "text-blue-400"
-            icon = "ℹ️"
-        elif "DEBUG" in log_line:
-            color_class = "text-gray-400 text-xs"
-            icon = "🔍"
-        else:
-            color_class = "text-gray-300"
-            icon = "•"
-
-        # 转义 HTML 特殊字符
-        log_escaped = log_line.replace('<', '&lt;').replace('>', '&gt;')
-
-        html += f'<div class="{color_class} py-0.5 hover:bg-gray-800 px-2 rounded transition-colors">{icon} {log_escaped}</div>'
-
-    return HTMLResponse(html)
+    """兼容旧日志面板：提示改看平台日志。"""
+    return _build_alert(
+        (
+            "当前版本不再读取本地日志文件。请在 Vercel 项目面板的 "
+            "Runtime Logs 中查看线上日志，本地开发时请直接查看终端输出。"
+        ),
+        title="日志查看说明",
+        level="info",
+    )
 
 
 # ==================== Token 管理 API ====================
 
-@router.get("/tokens/list", response_class=HTMLResponse)
+@router.get(
+    "/tokens/list",
+    response_class=HTMLResponse,
+    dependencies=[Depends(require_auth)],
+)
 async def get_tokens_list(request: Request):
     """获取 Token 列表（HTML 片段）"""
     from app.services.token_dao import get_token_dao
@@ -626,7 +525,7 @@ async def get_tokens_list(request: Request):
     return templates.TemplateResponse("components/token_list.html", context)
 
 
-@router.post("/tokens/add")
+@router.post("/tokens/add", dependencies=[Depends(require_auth)])
 async def add_tokens(request: Request):
     """添加 Token"""
     from app.services.token_dao import get_token_dao
@@ -680,103 +579,36 @@ async def add_tokens(request: Request):
 
     # 生成响应
     if added_count > 0 and failed_count == 0:
-        return HTMLResponse(f"""
-        <div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded relative" role="alert">
-            <strong class="font-bold">成功！</strong>
-            <span class="block sm:inline">已添加 {added_count} 个有效 Token</span>
-        </div>
-        """)
-    elif added_count > 0 and failed_count > 0:
-        return HTMLResponse(f"""
-        <div class="bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-3 rounded relative" role="alert">
-            <strong class="font-bold">部分成功！</strong>
-            <span class="block sm:inline">已添加 {added_count} 个 Token，{failed_count} 个失败（可能是重复、无效或匿名 Token）</span>
-        </div>
-        """)
-    else:
-        return HTMLResponse("""
-        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative" role="alert">
-            <strong class="font-bold">失败！</strong>
-            <span class="block sm:inline">所有 Token 添加失败（可能是重复、无效或匿名 Token）</span>
-        </div>
-        """)
+        return _build_alert(
+            f"已添加 {added_count} 个有效 Token",
+            title="成功！",
+            level="success",
+        )
+    if added_count > 0 and failed_count > 0:
+        return _build_alert(
+            (
+                f"已添加 {added_count} 个 Token，{failed_count} 个失败"
+                "（可能是重复、无效或匿名 Token）"
+            ),
+            title="部分成功！",
+            level="warning",
+        )
+    return _build_alert(
+        "所有 Token 添加失败（可能是重复、无效或匿名 Token）",
+        title="失败！",
+        level="error",
+        status_code=400,
+    )
 
 
 @router.post("/tokens/import-directory", dependencies=[Depends(require_auth)])
 async def import_tokens_from_directory_api(request: Request):
-    """从本地目录导入 token 文件。"""
-    from app.core.config import settings
-    from app.services.token_automation import run_directory_import
-
-    form_data = await request.form()
-    source_dir = str(
-        form_data.get("source_dir")
-        or settings.TOKEN_AUTO_IMPORT_SOURCE_DIR
-        or ""
-    ).strip()
-    try:
-        source_dir = _validate_directory_path(source_dir)
-    except ValueError as exc:
-        return _build_alert(
-            str(exc),
-            title="导入失败！",
-            level="error",
-            status_code=400,
-        )
-
-    try:
-        summary = await run_directory_import(
-            source_dir,
-            provider=DEFAULT_TOKEN_NAMESPACE,
-            validate=True,
-        )
-    except (FileNotFoundError, NotADirectoryError) as exc:
-        return _build_alert(
-            str(exc),
-            title="导入失败！",
-            level="error",
-            status_code=400,
-        )
-    except RuntimeError as exc:
-        return _build_alert(
-            str(exc),
-            title="导入稍后重试",
-            level="warning",
-            status_code=409,
-        )
-    except Exception as exc:
-        logger.exception(f"❌ 本地目录导入 Token 失败: {exc}")
-        return _build_alert(
-            f"目录扫描或入库异常: {exc}",
-            title="导入失败！",
-            level="error",
-            status_code=500,
-        )
-
-    if summary.imported_count > 0:
-        title = "导入成功！" if summary.failed_count == 0 else "导入完成！"
-        detail = (
-            f"目录 {summary.source_dir} 共扫描 {summary.scanned_files} 个文件，"
-            f"成功导入 {summary.imported_count} 个 Token，"
-            f"重复 {summary.duplicate_count} 个，"
-            f"无效 JSON {summary.invalid_json_count} 个，"
-            f"缺少 token {summary.missing_token_count} 个，"
-            f"验证失败 {summary.invalid_token_count} 个。"
-        )
-        return _build_alert(
-            detail,
-            title=title,
-            level="success" if summary.failed_count == 0 else "warning",
-        )
-
+    """目录导入已弃用。"""
     return _build_alert(
-        (
-            f"目录 {summary.source_dir} 共扫描 {summary.scanned_files} 个文件，"
-            f"其中重复 {summary.duplicate_count} 个，无效 JSON {summary.invalid_json_count} 个，"
-            f"缺少 token {summary.missing_token_count} 个，验证失败 {summary.invalid_token_count} 个。"
-        ),
-        title="未导入任何 Token！",
+        "当前版本已移除服务端本地目录导入，请改用页面中的手动单个/批量添加 Token。",
+        title="目录导入已移除",
         level="warning",
+        status_code=410,
     )
 
 
@@ -784,8 +616,8 @@ async def import_tokens_from_directory_api(request: Request):
 async def save_auto_import_settings(request: Request):
     """兼容旧入口，提示用户改到配置管理页。"""
     return _build_alert(
-        "自动导入配置入口已迁移到 /admin/config#tokens，当前页面仅保留手动执行入口。",
-        title="入口已迁移",
+        "目录自动导入已移除，请改用手动单个/批量导入。",
+        title="功能已移除",
         level="info",
     )
 
@@ -825,7 +657,10 @@ async def run_token_maintenance_api(request: Request):
 
     if not any((remove_duplicates, run_health_check, delete_invalid)):
         return _build_alert(
-            "当前没有可执行的维护动作，请先到 /admin/config#tokens 配置至少一个维护动作。",
+            (
+                "当前没有可执行的维护动作，请先到 "
+                "/admin/config#tokens 配置至少一个维护动作。"
+            ),
             title="未执行维护！",
             level="warning",
             status_code=400,
@@ -866,7 +701,10 @@ async def run_token_maintenance_api(request: Request):
     )
 
 
-@router.post("/tokens/toggle/{token_id}")
+@router.post(
+    "/tokens/toggle/{token_id}",
+    dependencies=[Depends(require_auth)],
+)
 async def toggle_token(token_id: int, enabled: bool):
     """切换 Token 启用状态"""
     from app.services.token_dao import get_token_dao
@@ -878,14 +716,9 @@ async def toggle_token(token_id: int, enabled: bool):
     # 同步 Token 池状态
     pool = get_token_pool()
     if pool:
-        # 获取 Token 的提供商信息
-        async with dao.get_connection() as conn:
-            cursor = await conn.execute("SELECT provider FROM tokens WHERE id = ?", (token_id,))
-            row = await cursor.fetchone()
-            if row:
-                provider = row[0]
-                await pool.sync_from_database(provider)
-                logger.info("✅ Token 池已同步")
+        provider = await dao.get_token_provider(token_id)
+        await pool.sync_from_database(provider)
+        logger.info("✅ Token 池已同步")
 
     # 根据状态返回不同样式的按钮
     if enabled:
@@ -899,17 +732,24 @@ async def toggle_token(token_id: int, enabled: bool):
         label = "已禁用"
         next_state = "true"
 
+    button_classes = (
+        "inline-flex items-center px-2.5 py-0.5 text-xs "
+        f"font-semibold rounded-full transition-colors {button_class}"
+    )
     return HTMLResponse(f"""
     <button hx-post="/admin/api/tokens/toggle/{token_id}?enabled={next_state}"
             hx-swap="outerHTML"
-            class="inline-flex items-center px-2.5 py-0.5 text-xs font-semibold rounded-full transition-colors {button_class}">
+            class="{button_classes}">
         <span class="h-2 w-2 rounded-full mr-1.5 {indicator_class}"></span>
         {label}
     </button>
     """)
 
 
-@router.delete("/tokens/delete/{token_id}")
+@router.delete(
+    "/tokens/delete/{token_id}",
+    dependencies=[Depends(require_auth)],
+)
 async def delete_token(token_id: int):
     """删除 Token"""
     from app.services.token_dao import get_token_dao
@@ -918,10 +758,7 @@ async def delete_token(token_id: int):
     dao = get_token_dao()
 
     # 获取 Token 信息以确定提供商
-    async with dao.get_connection() as conn:
-        cursor = await conn.execute("SELECT provider FROM tokens WHERE id = ?", (token_id,))
-        row = await cursor.fetchone()
-        provider = row[0] if row else "zai"
+    provider = await dao.get_token_provider(token_id)
 
     await dao.delete_token(token_id)
 
@@ -934,7 +771,11 @@ async def delete_token(token_id: int):
     return HTMLResponse("")  # 返回空内容，让 htmx 移除元素
 
 
-@router.get("/tokens/stats", response_class=HTMLResponse)
+@router.get(
+    "/tokens/stats",
+    response_class=HTMLResponse,
+    dependencies=[Depends(require_auth)],
+)
 async def get_tokens_stats(request: Request):
     """获取 Token 统计信息（HTML 片段）"""
     stats_data = await collect_admin_stats(DEFAULT_TOKEN_NAMESPACE)
@@ -947,7 +788,7 @@ async def get_tokens_stats(request: Request):
     return templates.TemplateResponse("components/token_stats.html", context)
 
 
-@router.post("/tokens/validate")
+@router.post("/tokens/validate", dependencies=[Depends(require_auth)])
 async def validate_tokens():
     """批量验证 Token"""
     from app.services.token_dao import get_token_dao
@@ -968,24 +809,29 @@ async def validate_tokens():
 
     # 生成通知消息
     if guest_count > 0:
-        message_class = "bg-yellow-100 border-yellow-400 text-yellow-700"
-        message = f"验证完成：有效 {valid_count} 个，匿名 {guest_count} 个，无效 {invalid_count} 个。匿名 Token 已标记。"
+        message = (
+            f"验证完成：有效 {valid_count} 个，匿名 {guest_count} 个，"
+            f"无效 {invalid_count} 个。匿名 Token 已标记。"
+        )
+        level = "warning"
     elif invalid_count > 0:
-        message_class = "bg-blue-100 border-blue-400 text-blue-700"
         message = f"验证完成：有效 {valid_count} 个，无效 {invalid_count} 个。"
+        level = "info"
     else:
-        message_class = "bg-green-100 border-green-400 text-green-700"
         message = f"验证完成：所有 {valid_count} 个 Token 均有效！"
+        level = "success"
 
-    return HTMLResponse(f"""
-    <div class="{message_class} border px-4 py-3 rounded relative" role="alert">
-        <strong class="font-bold">批量验证完成！</strong>
-        <span class="block sm:inline">{message}</span>
-    </div>
-    """)
+    return _build_alert(
+        message,
+        title="批量验证完成！",
+        level=level,
+    )
 
 
-@router.post("/tokens/validate-single/{token_id}")
+@router.post(
+    "/tokens/validate-single/{token_id}",
+    dependencies=[Depends(require_auth)],
+)
 async def validate_single_token(request: Request, token_id: int):
     """验证单个 Token 并返回更新后的行"""
     from app.services.token_dao import get_token_dao
@@ -1001,19 +847,10 @@ async def validate_single_token(request: Request, token_id: int):
         await pool.sync_from_database(DEFAULT_TOKEN_NAMESPACE)
 
     # 获取更新后的 Token 信息
-    async with dao.get_connection() as conn:
-        cursor = await conn.execute("""
-            SELECT t.*, ts.total_requests, ts.successful_requests, ts.failed_requests,
-                   ts.last_success_time, ts.last_failure_time
-            FROM tokens t
-            LEFT JOIN token_stats ts ON t.id = ts.token_id
-            WHERE t.id = ?
-        """, (token_id,))
-        row = await cursor.fetchone()
+    token = await dao.get_token_with_stats(token_id)
 
-    if row:
+    if token:
         # 返回更新后的单行 HTML
-        token = dict(row)
         context = {
             "request": request,
             "token": token,
@@ -1024,7 +861,7 @@ async def validate_single_token(request: Request, token_id: int):
         return HTMLResponse("")
 
 
-@router.post("/tokens/health-check")
+@router.post("/tokens/health-check", dependencies=[Depends(require_auth)])
 async def health_check_tokens():
     """执行 Token 池健康检查"""
     from app.utils.token_pool import get_token_pool
@@ -1032,12 +869,11 @@ async def health_check_tokens():
     pool = get_token_pool()
 
     if not pool:
-        return HTMLResponse("""
-        <div class="bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-3 rounded relative" role="alert">
-            <strong class="font-bold">提示！</strong>
-            <span class="block sm:inline">Token 池未初始化，请重启服务。</span>
-        </div>
-        """)
+        return _build_alert(
+            "Token 池未初始化，请重启服务。",
+            title="提示！",
+            level="warning",
+        )
 
     # 执行健康检查
     await pool.health_check_all()
@@ -1048,24 +884,23 @@ async def health_check_tokens():
     total_count = status.get("total_tokens", 0)
 
     if healthy_count == total_count:
-        message_class = "bg-green-100 border-green-400 text-green-700"
         message = f"所有 {total_count} 个 Token 均健康！"
+        level = "success"
     elif healthy_count > 0:
-        message_class = "bg-blue-100 border-blue-400 text-blue-700"
         message = f"健康检查完成：{healthy_count}/{total_count} 个 Token 健康。"
+        level = "info"
     else:
-        message_class = "bg-red-100 border-red-400 text-red-700"
         message = f"警告：0/{total_count} 个 Token 健康，请检查配置。"
+        level = "error"
 
-    return HTMLResponse(f"""
-    <div class="{message_class} border px-4 py-3 rounded relative" role="alert">
-        <strong class="font-bold">健康检查完成！</strong>
-        <span class="block sm:inline">{message}</span>
-    </div>
-    """)
+    return _build_alert(
+        message,
+        title="健康检查完成！",
+        level=level,
+    )
 
 
-@router.post("/tokens/sync-pool")
+@router.post("/tokens/sync-pool", dependencies=[Depends(require_auth)])
 async def sync_token_pool():
     """手动同步 Token 池（从数据库重新加载）"""
     from app.utils.token_pool import get_token_pool
@@ -1073,12 +908,11 @@ async def sync_token_pool():
     pool = get_token_pool()
 
     if not pool:
-        return HTMLResponse("""
-        <div class="bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-3 rounded relative" role="alert">
-            <strong class="font-bold">提示！</strong>
-            <span class="block sm:inline">Token 池未初始化，请重启服务。</span>
-        </div>
-        """)
+        return _build_alert(
+            "Token 池未初始化，请重启服务。",
+            title="提示！",
+            level="warning",
+        )
 
     # 从数据库同步
     await pool.sync_from_database(DEFAULT_TOKEN_NAMESPACE)
@@ -1090,22 +924,30 @@ async def sync_token_pool():
     user_count = status.get("user_tokens", 0)
 
     logger.info(
-        f"✅ Token 池手动同步完成，总计 {total_count} 个 Token, 可用 {available_count} 个, 认证用户 {user_count} 个"
+        "✅ Token 池手动同步完成，总计 {} 个 Token, 可用 {} 个, 认证用户 {} 个",
+        total_count,
+        available_count,
+        user_count,
     )
 
     if total_count == 0:
-        message_class = "bg-yellow-100 border-yellow-400 text-yellow-700"
         message = "同步完成：当前没有可用 Token，请在数据库中启用 Token。"
+        level = "warning"
     elif available_count == 0:
-        message_class = "bg-orange-100 border-orange-400 text-orange-700"
-        message = f"同步完成：共 {total_count} 个 Token，但无可用 Token（可能都已禁用）。"
+        message = (
+            f"同步完成：共 {total_count} 个 Token，但无可用 Token"
+            "（可能都已禁用）。"
+        )
+        level = "warning"
     else:
-        message_class = "bg-green-100 border-green-400 text-green-700"
-        message = f"同步完成：共 {total_count} 个 Token，{available_count} 个可用，{user_count} 个认证用户。"
+        message = (
+            f"同步完成：共 {total_count} 个 Token，{available_count} 个可用，"
+            f"{user_count} 个认证用户。"
+        )
+        level = "success"
 
-    return HTMLResponse(f"""
-    <div class="{message_class} border px-4 py-3 rounded relative" role="alert">
-        <strong class="font-bold">Token 池同步完成！</strong>
-        <span class="block sm:inline">{message}</span>
-    </div>
-    """)
+    return _build_alert(
+        message,
+        title="Token 池同步完成！",
+        level=level,
+    )

@@ -9,6 +9,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.config import settings
+from app.core.upstream import UpstreamClient
 from app.models.schemas import (
     Choice,
     Message,
@@ -18,7 +19,6 @@ from app.models.schemas import (
     OpenAIResponse,
     Usage,
 )
-from app.core.upstream import UpstreamClient
 from app.utils.logger import get_logger
 from app.utils.request_logging import (
     extract_openai_usage,
@@ -31,13 +31,32 @@ logger = get_logger()
 router = APIRouter()
 
 _upstream_client: Optional[UpstreamClient] = None
+_upstream_signature: Optional[tuple] = None
+
+
+def _build_upstream_signature() -> tuple:
+    return (
+        settings.API_ENDPOINT,
+        settings.GLM45_MODEL,
+        settings.GLM45_THINKING_MODEL,
+        settings.GLM45_SEARCH_MODEL,
+        settings.GLM45_AIR_MODEL,
+        settings.GLM46V_MODEL,
+        settings.GLM5_MODEL,
+        settings.GLM47_MODEL,
+        settings.GLM47_THINKING_MODEL,
+        settings.GLM47_SEARCH_MODEL,
+        settings.GLM47_ADVANCED_SEARCH_MODEL,
+    )
 
 
 def get_upstream_client() -> UpstreamClient:
     """获取懒加载的上游适配器单例。"""
-    global _upstream_client
-    if _upstream_client is None:
+    global _upstream_client, _upstream_signature
+    current_signature = _build_upstream_signature()
+    if _upstream_client is None or _upstream_signature != current_signature:
         _upstream_client = UpstreamClient()
+        _upstream_signature = current_signature
     return _upstream_client
 
 
@@ -99,7 +118,10 @@ async def list_models():
         return JSONResponse(content=response.model_dump(exclude_none=True))
     except Exception as exc:
         logger.error(f"❌ 获取模型列表失败: {exc}")
-        raise HTTPException(status_code=500, detail=f"Failed to list models: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list models: {exc}",
+        ) from exc
 
 
 @router.post("/v1/chat/completions")
@@ -125,7 +147,10 @@ async def chat_completions(
     try:
         if not settings.SKIP_AUTH_TOKEN:
             if not authorization or not authorization.startswith("Bearer "):
-                raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+                raise HTTPException(
+                    status_code=401,
+                    detail="Missing or invalid Authorization header",
+                )
 
             api_key = authorization[7:]
             if api_key != settings.AUTH_TOKEN:
@@ -165,6 +190,11 @@ async def chat_completions(
 
         if isinstance(result, dict):
             usage = extract_openai_usage(result)
+            error_message = (
+                (result.get("error") or {}).get("message")
+                if isinstance(result, dict)
+                else None
+            )
             await write_request_log(
                 provider="zai",
                 model=body.model,
@@ -177,7 +207,7 @@ async def chat_completions(
                 cache_creation_tokens=usage["cache_creation_tokens"],
                 cache_read_tokens=usage["cache_read_tokens"],
                 total_tokens=usage["total_tokens"],
-                error_message=(result.get("error") or {}).get("message") if isinstance(result, dict) else None,
+                error_message=error_message,
             )
             return JSONResponse(content=result)
 
@@ -221,4 +251,7 @@ async def chat_completions(
             status_code=500,
             error_message=str(exc),
         )
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(exc)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {exc}",
+        ) from exc
