@@ -975,7 +975,20 @@ class UpstreamClient:
             if not isinstance(tool_call, dict):
                 continue
 
-            function_data = tool_call.get("function") or {}
+            function_data = (
+                tool_call.get("function")
+                if isinstance(tool_call.get("function"), dict)
+                else {}
+            )
+            arguments = function_data.get("arguments", "{}")
+            if arguments is None:
+                arguments = "{}"
+            elif not isinstance(arguments, str):
+                try:
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                except Exception:
+                    arguments = str(arguments)
+
             normalized.append(
                 {
                     "index": tool_call.get("index", start_index + offset),
@@ -983,7 +996,7 @@ class UpstreamClient:
                     "type": "function",
                     "function": {
                         "name": function_data.get("name", ""),
-                        "arguments": function_data.get("arguments", ""),
+                        "arguments": arguments,
                     },
                 }
             )
