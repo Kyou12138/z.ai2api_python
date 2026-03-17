@@ -665,7 +665,10 @@ class UpstreamClient:
         model_profile: Dict[str, Any],
     ) -> bool:
         """判断当前模型是否适合直接透传原生 tools 给上游。"""
-        return bool(model_profile.get("use_persisted_chat"))
+        # 2026-03: 当前实测 glm-5 / glm-4.7 / glm-4.6v 原生 tools
+        # 直透到 z.ai 都会立即返回 INTERNAL_ERROR，因此统一回退到
+        # 本地 prompt 兼容模式，避免浏览器端持续收到错误 SSE。
+        return False
 
     def _build_request_variables(self) -> Dict[str, str]:
         """构建上游请求需要的运行时变量。"""
@@ -1580,7 +1583,9 @@ class UpstreamClient:
                 tools,
                 tool_choice=_resolve_tool_prompt_choice(tool_choice),
             )
-            self.logger.info(f"🧰 当前模型使用本地工具提示兼容模式: {len(tools)} 个工具")
+            self.logger.info(
+                f"🧰 上游原生 tools 暂不可用，回退本地工具提示兼容模式: {len(tools)} 个工具"
+            )
 
         if use_persisted_chat:
             chat_id = await self._create_upstream_chat(

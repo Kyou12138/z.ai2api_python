@@ -327,6 +327,66 @@ async def test_glm5_tools_use_prompt_compat_mode(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_glm47_tools_use_prompt_compat_mode(monkeypatch):
+    create_chat_calls: list[dict] = []
+
+    def fake_headers(chat_id: str = "", browser_type=None):
+        headers = dict(FAKE_HEADERS)
+        headers["Referer"] = (
+            f"https://chat.z.ai/c/{chat_id}"
+            if chat_id
+            else FAKE_HEADERS["Referer"]
+        )
+        return headers
+
+    async def fake_create_chat(
+        self,
+        *,
+        prompt,
+        model,
+        token,
+        headers,
+        enable_thinking,
+        web_search,
+        user_message_id,
+        files,
+        feature_entries,
+        mcp_servers,
+    ):
+        create_chat_calls.append(
+            {
+                "prompt": prompt,
+                "model": model,
+                "token": token,
+            }
+        )
+        return "persisted-chat-id"
+
+    monkeypatch.setattr(UpstreamClient, "get_auth_info", _fake_get_auth_info)
+    monkeypatch.setattr(UpstreamClient, "_create_upstream_chat", fake_create_chat)
+    monkeypatch.setattr(upstream_module, "get_dynamic_headers", fake_headers)
+
+    client = UpstreamClient()
+    request = OpenAIRequest(
+        model="GLM-4.7",
+        messages=[
+            Message(role="system", content="你是测试助手。"),
+            Message(role="user", content="请根据需要调用工具。"),
+        ],
+        stream=True,
+        tools=FAKE_TOOLS,
+    )
+
+    transformed = await client.transform_request(request)
+
+    assert len(create_chat_calls) == 1
+    assert transformed["chat_id"] == "persisted-chat-id"
+    assert "tools" not in transformed["body"]
+    assert transformed["body"]["messages"][0]["role"] == "system"
+    assert "Available Tools" in transformed["body"]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
 async def test_glm46v_uses_persisted_chat_and_visual_features(monkeypatch):
     create_chat_calls: list[dict] = []
     upload_calls: list[dict] = []
