@@ -107,3 +107,45 @@ async def test_stream_tool_calls_stringifies_arguments(monkeypatch):
     }
 
     assert chunks[3] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_stream_supports_event_and_multiline_data(monkeypatch):
+    monkeypatch.setattr(upstream_module.settings, "TOOL_SUPPORT", True)
+
+    response = _FakeResponse(
+        [
+            "event: chat:completion",
+            'data: {"data": {',
+            'data: "phase": "answer",',
+            'data: "delta_content": "你好"',
+            "data: }}",
+            "",
+            "event: chat:completion",
+            'data: {"data": {"done": true}}',
+            "",
+        ]
+    )
+
+    client = UpstreamClient()
+    chunks = []
+    async for chunk in client._handle_stream_response(
+        response,
+        "chatcmpl-test",
+        "GLM-5",
+        _build_request(),
+        {"auth_mode": "authenticated"},
+    ):
+        chunks.append(chunk)
+
+    assert len(chunks) == 4
+
+    role_payload = json.loads(chunks[0][6:].strip())
+    assert role_payload["choices"][0]["delta"] == {"role": "assistant"}
+
+    content_payload = json.loads(chunks[1][6:].strip())
+    assert content_payload["choices"][0]["delta"] == {"content": "你好"}
+
+    finish_payload = json.loads(chunks[2][6:].strip())
+    assert finish_payload["choices"][0]["finish_reason"] == "stop"
+    assert chunks[3] == "data: [DONE]\n\n"

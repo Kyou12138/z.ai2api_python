@@ -211,7 +211,7 @@ async def test_non_glm47_request_keeps_legacy_request_shape(monkeypatch):
     transformed = await client.transform_request(_make_request("GLM-4.5"))
     query = parse_qs(urlparse(transformed["url"]).query)
 
-    assert transformed["headers"]["Accept"] == "application/json"
+    assert transformed["headers"]["Accept"] == "application/json, text/event-stream"
     assert transformed["chat_id"] != "persisted-chat-id"
     assert "user_agent" not in query
     assert "session_id" in transformed["body"]
@@ -240,7 +240,7 @@ async def test_glm5_defaults_to_enable_thinking(monkeypatch):
     transformed = await client.transform_request(_make_request("GLM-5"))
     query = parse_qs(urlparse(transformed["url"]).query)
 
-    assert transformed["headers"]["Accept"] == "application/json"
+    assert transformed["headers"]["Accept"] == "application/json, text/event-stream"
     assert transformed["body"]["model"] == "glm-5"
     assert transformed["body"]["features"]["enable_thinking"] is True
     assert transformed["body"]["features"]["preview_mode"] is True

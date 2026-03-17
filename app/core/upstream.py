@@ -1024,6 +1024,82 @@ class UpstreamClient:
 
         return "\n\n---\n" + "\n".join(citations)
 
+    async def _iter_upstream_sse_payloads(
+        self,
+        response: httpx.Response,
+    ) -> AsyncGenerator[Tuple[Optional[str], str, int], None]:
+        """按 SSE 事件块迭代上游负载，兼容 event/data 多行格式。"""
+        current_event: Optional[str] = None
+        data_lines: List[str] = []
+        raw_line_count = 0
+
+        def flush_payload() -> Optional[Tuple[Optional[str], str, int]]:
+            nonlocal current_event, data_lines
+            if not data_lines:
+                return None
+
+            payload = "\n".join(data_lines).strip()
+            event_name = current_event
+            current_event = None
+            data_lines = []
+            if not payload:
+                return None
+            return event_name, payload, raw_line_count
+
+        def can_auto_flush() -> bool:
+            if current_event is not None or not data_lines:
+                return False
+
+            payload = "\n".join(data_lines).strip()
+            if payload in ("[DONE]", "DONE", "done"):
+                return True
+
+            try:
+                json.loads(payload)
+            except Exception:
+                return False
+            return True
+
+        async for raw_line in response.aiter_lines():
+            raw_line_count += 1
+            current_line = raw_line.rstrip("\r")
+            stripped_line = current_line.strip()
+
+            if not stripped_line:
+                flushed = flush_payload()
+                if flushed:
+                    yield flushed
+                continue
+
+            if stripped_line.startswith(":"):
+                continue
+
+            if stripped_line.startswith("event:"):
+                current_event = stripped_line[6:].strip() or None
+                continue
+
+            if stripped_line.startswith("data:"):
+                if can_auto_flush():
+                    flushed = flush_payload()
+                    if flushed:
+                        yield flushed
+                data_lines.append(stripped_line[5:].lstrip())
+                continue
+
+            if not data_lines and stripped_line[0] in "{[":
+                yield current_event, stripped_line, raw_line_count
+                current_event = None
+                continue
+
+            if raw_line_count <= 5:
+                self.logger.debug(
+                    f"⚠️ 跳过无法识别的上游流行: {stripped_line[:200]}"
+                )
+
+        flushed = flush_payload()
+        if flushed:
+            yield flushed
+
     def _get_proxy_config(self) -> Optional[str]:
         """Get proxy configuration from settings"""
         # In httpx 0.28.1, proxy parameter expects a single URL string
@@ -1587,7 +1663,15 @@ class UpstreamClient:
             {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-                "Accept": "*/*" if use_persisted_chat else "application/json",
+                "Accept": (
+                    "*/*"
+                    if use_persisted_chat
+                    else (
+                        "application/json, text/event-stream"
+                        if request.stream
+                        else "application/json"
+                    )
+                ),
                 "X-FE-Version": fe_version,
                 "X-Signature": signature,
             }
@@ -1946,6 +2030,10 @@ class UpstreamClient:
     ) -> AsyncGenerator[str, None]:
         """处理上游流式响应"""
         self.logger.info("✅ 上游响应成功，开始处理 SSE 流")
+        response_headers = getattr(response, "headers", {}) or {}
+        self.logger.info(
+            f"🛰️ 上游流响应类型: {response_headers.get('content-type', '(unknown)')}"
+        )
 
         has_tools = settings.TOOL_SUPPORT and bool(request.tools)
         buffered_content = ""
@@ -1957,7 +2045,8 @@ class UpstreamClient:
         tool_calls_accum: List[Dict[str, Any]] = []
         has_sent_role = False
         finished = False
-        line_count = 0
+        raw_line_count = 0
+        event_count = 0
 
         async def ensure_role_sent() -> Optional[str]:
             nonlocal has_sent_role
@@ -2009,20 +2098,9 @@ class UpstreamClient:
             finished = True
 
         try:
-            async for line in response.aiter_lines():
-                line_count += 1
-                if not line:
-                    continue
-
-                current_line = line.strip()
-                if not current_line.startswith("data:"):
-                    continue
-
-                chunk_str = current_line[5:].strip()
-                if not chunk_str:
-                    continue
-
-                if chunk_str == "[DONE]":
+            async for event_name, chunk_str, raw_line_count in self._iter_upstream_sse_payloads(response):
+                event_count += 1
+                if chunk_str in ("[DONE]", "DONE", "done"):
                     async for final_chunk in finalize_stream():
                         yield final_chunk
                     continue
@@ -2034,7 +2112,8 @@ class UpstreamClient:
                     continue
 
                 chunk_type = chunk.get("type")
-                data = chunk.get("data", {}) if chunk_type == "chat:completion" else chunk
+                event_type = event_name or chunk_type
+                data = chunk.get("data", {}) if event_type == "chat:completion" else chunk
                 if not isinstance(data, dict):
                     continue
 
@@ -2114,7 +2193,7 @@ class UpstreamClient:
                             )
                         )
 
-                elif phase == "search" or chunk_type == "web_search":
+                elif phase == "search" or event_type == "web_search":
                     citation_text = self._format_search_results(data)
                     if citation_text:
                         role_output = await ensure_role_sent()
@@ -2133,7 +2212,9 @@ class UpstreamClient:
                         yield final_chunk
                     return
 
-            self.logger.info(f"✅ SSE 流处理完成，共处理 {line_count} 行数据")
+            self.logger.info(
+                f"✅ SSE 流处理完成，读取 {raw_line_count} 行，解析 {event_count} 个事件"
+            )
 
             if not finished:
                 async for final_chunk in finalize_stream():
@@ -2165,14 +2246,15 @@ class UpstreamClient:
         }
 
         try:
-            async for line in response.aiter_lines():
-                if not line:
+            async for event_name, data_str, _ in self._iter_upstream_sse_payloads(response):
+                if data_str in ("[DONE]", "DONE", "done"):
                     continue
 
-                line = line.strip()
-                if not line.startswith("data:"):
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
                     try:
-                        maybe_err = json.loads(line)
+                        maybe_err = json.loads(data_str)
                         if isinstance(maybe_err, dict) and (
                             "error" in maybe_err or "code" in maybe_err or "message" in maybe_err
                         ):
@@ -2186,17 +2268,9 @@ class UpstreamClient:
                         pass
                     continue
 
-                data_str = line[5:].strip()
-                if not data_str or data_str in ("[DONE]", "DONE", "done"):
-                    continue
-
-                try:
-                    chunk = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
                 chunk_type = chunk.get("type")
-                data = chunk.get("data", {}) if chunk_type == "chat:completion" else chunk
+                event_type = event_name or chunk_type
+                data = chunk.get("data", {}) if event_type == "chat:completion" else chunk
                 if not isinstance(data, dict):
                     continue
 
@@ -2219,7 +2293,7 @@ class UpstreamClient:
                 elif phase == "other" and edit_content:
                     final_content += self._extract_answer_content(edit_content)
 
-                elif phase == "search" or chunk_type == "web_search":
+                elif phase == "search" or event_type == "web_search":
                     final_content += self._format_search_results(data)
 
                 tool_calls_accum.extend(
