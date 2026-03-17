@@ -50,7 +50,7 @@ docker compose -f deploy/docker-compose.yml up -d --build
 
 ### 部署到 Vercel
 
-仓库已经包含 [vercel.json](vercel.json) 和 [api/index.py](api/index.py)，可以直接作为 Vercel Python Function 部署。
+仓库已经包含 [vercel.json](vercel.json) 和根目录入口 [index.py](index.py)，可以直接按 Vercel 当前 FastAPI 方式部署。
 
 部署前请先准备一个外部 PostgreSQL 数据库，然后在 Vercel 项目环境变量中至少配置：
 
@@ -76,7 +76,7 @@ vercel --prod
 
 说明：
 
-- `vercel.json` 已将所有请求重写到 `api/index.py`，并内置每 5 分钟一次的 Token 维护 Cron。
+- `vercel.json` 仅保留内置 Cron；HTTP 请求会直接进入根目录 `index.py` 暴露的 FastAPI 应用。
 - Vercel 模式下不再依赖本地 `.env` 在线编辑，配置中心会把可热更新字段写入数据库。
 - Token 目录自动导入已移除，请改用后台页面的单个或批量添加。
 - 日志页改为查看说明，线上日志请直接在 Vercel Runtime Logs 中查看。

@@ -50,7 +50,7 @@ More deployment instructions see [deploy/README_DOCKER.md](deploy/README_DOCKER.
 
 ### Deploy to Vercel
 
-This repository already includes [vercel.json](vercel.json) and [api/index.py](api/index.py), so it can be deployed directly as a Vercel Python Function.
+This repository already includes [vercel.json](vercel.json) and the root entrypoint [index.py](index.py), so it can be deployed directly using Vercel's current FastAPI flow.
 
 Before deploying, prepare an external PostgreSQL database and configure at least these environment variables in your Vercel project:
 
@@ -76,7 +76,7 @@ vercel --prod
 
 Notes:
 
-- `vercel.json` already rewrites all requests to `api/index.py` and defines a 5-minute Token maintenance Cron.
+- `vercel.json` now only keeps the built-in Cron; HTTP traffic goes directly to the FastAPI app exposed from the root `index.py`.
 - In Vercel mode, the admin config page stores hot-reloadable fields in the database instead of editing `.env`.
 - Directory-based Token import has been removed. Use single or bulk Token entry from the admin panel instead.
 - The logs page now points you to Vercel Runtime Logs for production diagnostics.
