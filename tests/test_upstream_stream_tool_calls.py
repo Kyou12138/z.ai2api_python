@@ -149,3 +149,48 @@ async def test_stream_supports_event_and_multiline_data(monkeypatch):
     finish_payload = json.loads(chunks[2][6:].strip())
     assert finish_payload["choices"][0]["finish_reason"] == "stop"
     assert chunks[3] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_stream_surfaces_upstream_sse_error(monkeypatch):
+    monkeypatch.setattr(upstream_module.settings, "TOOL_SUPPORT", True)
+
+    response = _FakeResponse(
+        [
+            "data: "
+            + json.dumps(
+                {
+                    "type": "chat:completion",
+                    "data": {
+                        "content": "",
+                        "done": True,
+                        "error": {
+                            "code": "INTERNAL_ERROR",
+                            "detail": "Oops, something went wrong.",
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            "",
+            'data: {"data":"[DONE]"}',
+            "",
+        ]
+    )
+
+    client = UpstreamClient()
+    chunks = []
+    async for chunk in client._handle_stream_response(
+        response,
+        "chatcmpl-test",
+        "GLM-5",
+        _build_request(),
+        {"auth_mode": "authenticated"},
+    ):
+        chunks.append(chunk)
+
+    assert len(chunks) == 2
+    error_payload = json.loads(chunks[0][6:].strip())
+    assert error_payload["error"]["code"] == "INTERNAL_ERROR"
+    assert "Oops, something went wrong." in error_payload["error"]["message"]
+    assert chunks[1] == "data: [DONE]\n\n"

@@ -22,6 +22,17 @@ FAKE_HEADERS = {
     "Referer": "https://chat.z.ai/",
 }
 
+FAKE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "搜索网页",
+            "parameters": {"type": "object"},
+        },
+    }
+]
+
 
 def _make_request(model: str) -> OpenAIRequest:
     return OpenAIRequest(
@@ -277,6 +288,42 @@ async def test_glm5_allows_explicitly_disabling_thinking(monkeypatch):
     transformed = await client.transform_request(request)
 
     assert transformed["body"]["features"]["enable_thinking"] is False
+
+
+@pytest.mark.asyncio
+async def test_glm5_tools_use_prompt_compat_mode(monkeypatch):
+    def fake_headers(chat_id: str = "", browser_type=None):
+        headers = dict(FAKE_HEADERS)
+        headers["Referer"] = (
+            f"https://chat.z.ai/c/{chat_id}"
+            if chat_id
+            else FAKE_HEADERS["Referer"]
+        )
+        return headers
+
+    async def fail_create_chat(self, **kwargs):
+        raise AssertionError("GLM-5 不应触发 create_chat")
+
+    monkeypatch.setattr(UpstreamClient, "get_auth_info", _fake_get_auth_info)
+    monkeypatch.setattr(UpstreamClient, "_create_upstream_chat", fail_create_chat)
+    monkeypatch.setattr(upstream_module, "get_dynamic_headers", fake_headers)
+
+    client = UpstreamClient()
+    request = OpenAIRequest(
+        model="GLM-5",
+        messages=[
+            Message(role="system", content="你是测试助手。"),
+            Message(role="user", content="请根据需要调用工具。"),
+        ],
+        stream=True,
+        tools=FAKE_TOOLS,
+    )
+
+    transformed = await client.transform_request(request)
+
+    assert transformed["body"]["tools"] is None
+    assert transformed["body"]["messages"][0]["role"] == "system"
+    assert "Available Tools" in transformed["body"]["messages"][0]["content"]
 
 
 @pytest.mark.asyncio

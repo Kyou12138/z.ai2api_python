@@ -30,6 +30,7 @@ from app.utils.signature import generate_signature
 from app.utils.token_pool import get_token_pool
 from app.utils.tool_call_handler import (
     parse_and_extract_tool_calls,
+    process_messages_with_tools,
 )
 from app.utils.user_agent import get_random_user_agent
 
@@ -359,6 +360,19 @@ def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
+def _resolve_tool_prompt_choice(tool_choice: Any) -> str:
+    """将 OpenAI tool_choice 映射为提示词兼容模式。"""
+    if isinstance(tool_choice, str):
+        return tool_choice
+
+    if isinstance(tool_choice, dict):
+        choice_type = str(tool_choice.get("type") or "").strip().lower()
+        if choice_type == "none":
+            return "none"
+
+    return "auto"
+
+
 
 class UpstreamClient:
     """当前服务使用的上游适配器。"""
@@ -644,6 +658,14 @@ class UpstreamClient:
             "feature_entries": [],
             "default_enable_thinking": None,
         }
+
+    def _supports_native_upstream_tools(
+        self,
+        upstream_model_id: str,
+        model_profile: Dict[str, Any],
+    ) -> bool:
+        """判断当前模型是否适合直接透传原生 tools 给上游。"""
+        return bool(model_profile.get("use_persisted_chat"))
 
     def _build_request_variables(self) -> Dict[str, str]:
         """构建上游请求需要的运行时变量。"""
@@ -1432,6 +1454,9 @@ class UpstreamClient:
         tools = request.tools if settings.TOOL_SUPPORT and request.tools else None
         tool_choice = getattr(request, "tool_choice", None)
         model_profile = self._get_model_request_profile(upstream_model_id)
+        use_native_upstream_tools = bool(
+            tools and self._supports_native_upstream_tools(upstream_model_id, model_profile)
+        )
         enable_thinking = request.enable_thinking
         if enable_thinking is None:
             default_enable_thinking = model_profile["default_enable_thinking"]
@@ -1549,6 +1574,14 @@ class UpstreamClient:
             if message_content:
                 messages.append({"role": role, "content": message_content})
 
+        if tools and not use_native_upstream_tools:
+            messages = process_messages_with_tools(
+                messages,
+                tools,
+                tool_choice=_resolve_tool_prompt_choice(tool_choice),
+            )
+            self.logger.info(f"🧰 当前模型使用本地工具提示兼容模式: {len(tools)} 个工具")
+
         if use_persisted_chat:
             chat_id = await self._create_upstream_chat(
                 prompt=last_user_text,
@@ -1574,8 +1607,8 @@ class UpstreamClient:
                 enable_thinking=enable_thinking,
                 web_search=web_search,
                 files=files,
-                tools=tools,
-                tool_choice=tool_choice,
+                tools=tools if use_native_upstream_tools else None,
+                tool_choice=tool_choice if use_native_upstream_tools else None,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
                 mcp_servers=mcp_servers,
@@ -1625,7 +1658,7 @@ class UpstreamClient:
                 "current_user_message_id": message_id,
                 "current_user_message_parent_id": None,
             }
-            if tools:
+            if tools and use_native_upstream_tools:
                 body["tools"] = tools
                 if tool_choice is not None:
                     body["tool_choice"] = tool_choice
@@ -2117,6 +2150,24 @@ class UpstreamClient:
                 if not isinstance(data, dict):
                     continue
 
+                error_info = data.get("error")
+                if isinstance(error_info, dict) and (
+                    error_info.get("detail")
+                    or error_info.get("message")
+                    or error_info.get("code")
+                ):
+                    error_message = str(
+                        error_info.get("detail")
+                        or error_info.get("message")
+                        or "上游流式响应错误"
+                    )
+                    error_code = error_info.get("code") or 500
+                    self.logger.error(f"❌ 上游 SSE 返回错误: {error_message}")
+                    yield f"data: {json.dumps({'error': {'message': error_message, 'type': 'upstream_error', 'code': error_code}}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    finished = True
+                    return
+
                 phase = data.get("phase")
                 delta_content = data.get("delta_content", "")
                 edit_content = data.get("edit_content", "")
@@ -2273,6 +2324,19 @@ class UpstreamClient:
                 data = chunk.get("data", {}) if event_type == "chat:completion" else chunk
                 if not isinstance(data, dict):
                     continue
+
+                error_info = data.get("error")
+                if isinstance(error_info, dict) and (
+                    error_info.get("detail")
+                    or error_info.get("message")
+                    or error_info.get("code")
+                ):
+                    error_message = str(
+                        error_info.get("detail")
+                        or error_info.get("message")
+                        or "上游返回错误"
+                    )
+                    return handle_error(Exception(error_message), "API响应")
 
                 phase = data.get("phase")
                 delta_content = data.get("delta_content", "")
