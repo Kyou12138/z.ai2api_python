@@ -37,6 +37,33 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON request_logs(provider);
 CREATE INDEX IF NOT EXISTS idx_request_logs_source ON request_logs(source);
 """
 
+POSTGRES_REQUEST_LOG_REQUIRED_COLUMNS = {
+    "endpoint": "TEXT DEFAULT ''",
+    "source": "TEXT DEFAULT 'unknown'",
+    "protocol": "TEXT DEFAULT 'unknown'",
+    "client_name": "TEXT DEFAULT 'Unknown'",
+    "status_code": "INTEGER DEFAULT 200",
+    "duration": "DOUBLE PRECISION",
+    "first_token_time": "DOUBLE PRECISION",
+    "input_tokens": "INTEGER DEFAULT 0",
+    "output_tokens": "INTEGER DEFAULT 0",
+    "cache_creation_tokens": "INTEGER DEFAULT 0",
+    "cache_read_tokens": "INTEGER DEFAULT 0",
+    "total_tokens": "INTEGER DEFAULT 0",
+    "error_message": "TEXT",
+    "created_at": "TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
+}
+
+
+def _get_missing_required_columns(
+    existing_columns: set[str],
+) -> dict[str, str]:
+    return {
+        column: definition
+        for column, definition in POSTGRES_REQUEST_LOG_REQUIRED_COLUMNS.items()
+        if column not in existing_columns
+    }
+
 
 def _normalize_trend_window(window: Optional[str], days: Optional[int]) -> str:
     if window:
@@ -62,6 +89,29 @@ class PostgresRequestLogDAO:
         pool = await get_postgres_pool()
         async with pool.acquire() as conn:
             await conn.execute(POSTGRES_REQUEST_LOG_SQL)
+            await self._ensure_columns(conn)
+
+    async def _ensure_columns(self, conn) -> None:
+        """为旧 PostgreSQL 表结构补齐新增列。"""
+        existing_rows = await conn.fetch(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'request_logs'
+            """
+        )
+        existing_columns = {
+            str(row["column_name"])
+            for row in existing_rows
+        }
+
+        missing_columns = _get_missing_required_columns(existing_columns)
+        for column, definition in missing_columns.items():
+            await conn.execute(
+                f"ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS "
+                f"{column} {definition}"
+            )
+            logger.info("🩹 已为 request_logs 补齐列: {}", column)
 
     async def add_log(
         self,
@@ -224,10 +274,25 @@ class PostgresRequestLogDAO:
                 COALESCE(SUM(total_tokens), 0) AS total_tokens,
                 COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-                COALESCE(SUM(CASE WHEN cache_creation_tokens > 0 THEN 1 ELSE 0 END), 0) AS cache_creation_requests,
-                COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN 1 ELSE 0 END), 0) AS cache_hit_requests,
+                COALESCE(
+                    SUM(
+                        CASE WHEN cache_creation_tokens > 0 THEN 1 ELSE 0 END
+                    ),
+                    0
+                ) AS cache_creation_requests,
+                COALESCE(
+                    SUM(CASE WHEN cache_read_tokens > 0 THEN 1 ELSE 0 END),
+                    0
+                ) AS cache_hit_requests,
                 COALESCE(AVG(duration), 0) AS avg_duration,
-                COALESCE(AVG(CASE WHEN first_token_time > 0 THEN first_token_time END), 0) AS avg_first_token_time
+                COALESCE(
+                    AVG(
+                        CASE
+                            WHEN first_token_time > 0 THEN first_token_time
+                        END
+                    ),
+                    0
+                ) AS avg_first_token_time
             FROM request_logs
         """
         params: list[object] = []
@@ -311,7 +376,12 @@ class PostgresRequestLogDAO:
             rows = await self._query_usage_trend_rows(
                 provider,
                 start_time,
-                "to_char(date_trunc('hour', timestamp AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:00:00')",
+                (
+                    "to_char("
+                    "date_trunc('hour', timestamp AT TIME ZONE 'UTC'), "
+                    "'YYYY-MM-DD HH24:00:00'"
+                    ")"
+                ),
                 "trend_bucket",
             )
             rows_by_bucket = {str(row["trend_bucket"]): dict(row) for row in rows}
